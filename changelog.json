@@ -1,8 +1,9 @@
 {
-  "version": "1.0",
-  "date": "07-13-2025--3:09PM",
+  "version": "1.1.0",
+  "date": "07-21-2025--7:32AM",
   "changes": [
-    "Inital Bot Release",
-    "Have Fun"
+    "Added Overdrive Pathing",
+    "Added Midi Change Logs",
+    "Added Emojis To Track Info Embed"
   ]
 }
