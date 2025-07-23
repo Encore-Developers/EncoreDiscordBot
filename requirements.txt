@@ -1,0 +1,7 @@
+discord.py
+aiohttp
+pydub
+mido
+requests
+matplotlib
+numpy

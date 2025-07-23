@@ -159,20 +159,24 @@ def run_comparison(midi_file1_path, midi_file2_path, session_id, output_folder='
         
     generated_results = []
     
+    # Define the list of tracks to check based on the format
     if format == "ini":
+        # For INI format, we check for PART/PAD tracks, not PLASTIC tracks.
         tracks_to_compare = [
             'PART DRUMS', 'PART BASS', 'PART GUITAR', 
             'PAD VOCALS', 'PAD BASS', 'PAD DRUMS', 'PAD GUITAR', 
             'PRO VOCALS', 'BEAT', 'EVENTS', 'SECTION'
         ]
-    else: 
+    else:  # Default to JSON format
         tracks_to_compare = [
             'PART BASS', 'PART GUITAR', 'PART DRUMS', 'PART VOCALS', "PRO VOCALS", 
             "PLASTIC GUITAR", "PLASTIC DRUMS", "PLASTIC BASS", 'BEAT', 'EVENTS', 'SECTION'
         ]
 
+    # Get all unique track names present in either MIDI file
     all_present_track_names = sorted(list(set(tracks1.keys()) | set(tracks2.keys())))
 
+    # Filter the present tracks to only those we care about for the given format
     tracks_to_actually_compare = [name for name in all_present_track_names if name in tracks_to_compare]
 
     for track_name in tracks_to_actually_compare:
@@ -189,7 +193,9 @@ def run_comparison(midi_file1_path, midi_file2_path, session_id, output_folder='
         text_diffs = compare_text_events(text_events1, text_events2)
 
         if note_diffs or text_diffs:
+            # Determine the correct key for the note_name_maps dictionary
             note_map_key = track_name
+            # If it's a PAD track, use the corresponding PART map for note names
             if track_name.startswith("PAD"):
                 note_map_key = track_name.replace("PAD", "PART")
 

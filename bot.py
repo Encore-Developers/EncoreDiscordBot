@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -7,7 +11,6 @@ import asyncio
 import re
 import string
 import io
-import os
 import uuid
 import subprocess
 import mido
@@ -16,11 +19,12 @@ import enum
 import hashlib
 import logging
 import platform
+import random
 from difflib import get_close_matches
 from datetime import datetime, timedelta
 import statistics
 from pydub import AudioSegment
-
+from functools import partial
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +37,7 @@ JSON_DATA_URL = "https://raw.githubusercontent.com/JaydenzKoci/EncoreCustoms/ref
 ASSET_BASE_URL = "https://jaydenzkoci.github.io/EncoreCustoms"
 CONFIG_FILE = "config.json"
 TRACK_CACHE_FILE = "tracks_cache.json"
+TRACK_PLAYBACK_CONFIG_FILE = "track_playback_config.json"
 TRACK_HISTORY_FILE = "track_history.json"
 SUGGESTIONS_FILE = "suggestions.json"
 CHANGELOG_FILE = "changelog.json"
@@ -108,8 +113,11 @@ KEY_NAME_MAP = { # I added this for /trackhistory
 }
 
 intents = discord.Intents.default()
+intents.voice_states = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+music_queues = {} 
+music_control_messages = {}
 
 if not os.path.exists(LOCAL_MIDI_FOLDER): os.makedirs(LOCAL_MIDI_FOLDER)
 if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
@@ -132,6 +140,22 @@ def save_json_file(filename: str, data: dict | list):
     with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
 
+def ensure_playback_config():
+    logging.info("Checking and updating track playback config...")
+    playback_config = load_json_file(TRACK_PLAYBACK_CONFIG_FILE, default_data={})
+    cached_tracks = get_cached_track_data()
+    
+    updated = False
+    for track in cached_tracks:
+        track_id = track.get('id')
+        if track_id and track_id not in playback_config:
+            playback_config[track_id] = 0  # Default to 0ms start time
+            updated = True
+            logging.info(f"Added new track '{track_id}' to playback config with default start time.")
+
+    if updated:
+        save_json_file(TRACK_PLAYBACK_CONFIG_FILE, playback_config)
+        logging.info("Saved updates to track playback config.")
 
 class Instrument:
     def __init__(self, english:str, lb_code:str, plastic:bool, chopt:str, midi_mapping:dict, lb_enabled:bool = True, path_enabled: bool = True) -> None:
@@ -191,7 +215,7 @@ class MidiArchiveTools:
             return None
         
     def prepare_midi_for_chopt(self, midi_file: str, instrument: Instrument, session_hash: str, shortname: str, track_format: str) -> str:
-        source_mid = mido.MidiFile(midi_file)
+        source_mid = mido.MidiFile(midi_file, clip=True) # this is required to path midi's outside of a certain size
         new_mid = mido.MidiFile(type=source_mid.type, ticks_per_beat=source_mid.ticks_per_beat)
 
         source_track_name = instrument.midi_mapping.get(track_format)
@@ -208,7 +232,6 @@ class MidiArchiveTools:
             if track.name in ['EVENTS', 'BEAT']:
                 new_mid.tracks.append(track)
                 continue
-            
             if track.name == source_track_name:
                 track.name = target_track_name
                 new_mid.tracks.append(track)
@@ -708,19 +731,25 @@ class TrackSelectDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         try:
             track = self.tracks_map.get(self.values[0])
-            if not track: return
-            
-            if self.command_type == 'path':
-                await interaction.response.defer()
+            if not track:
+                await interaction.response.send_message("Error selecting track. Please try again.", ephemeral=True)
+                return
 
             self.view.stop()
-            if self.command_type == 'info':
+
+            if self.command_type == 'play':
+                await interaction.response.defer()
+                playback_handler = self.command_args.get('playback_handler')
+                if playback_handler:
+                    await playback_handler(track, interaction)
+            elif self.command_type == 'info':
                 embed, view = create_track_embed_and_view(track, interaction.user.id)
                 if embed: await interaction.response.edit_message(content=None, embed=embed, view=view)
             elif self.command_type == 'history':
                 view = HistoryPaginatorView(track, author_id=interaction.user.id)
                 await interaction.response.edit_message(content=None, embed=view.create_embed(), view=view)
             elif self.command_type == 'path':
+                await interaction.response.defer() 
                 content, embed, attachments, error = await generate_path_response(
                     user_id=interaction.user.id,
                     song_data=track,
@@ -736,7 +765,6 @@ class TrackSelectDropdown(discord.ui.Select):
                 pass
 
 class TrackSelectionView(discord.ui.View):
-    """The parent view for the track selection dropdown."""
     def __init__(self, tracks: list, author_id: int, command_type: str, sort: str = None, command_args: dict = None):
         super().__init__(timeout=60.0)
         self.author_id = author_id
@@ -790,7 +818,6 @@ class HistoryPaginatorView(discord.ui.View):
                 ts = int(datetime.fromisoformat(entry['timestamp']).timestamp())
                 desc += f"**<t:{ts}:F>**\n"
                 for key, values in entry['changes'].items():
-                    # This line is updated to use the global KEY_NAME_MAP for consistency
                     key_title = KEY_NAME_MAP.get(key) or KEY_NAME_MAP.get(key.lower(), key.replace('.', ' ').title())
                     desc += f"• **{key_title}**: `{values['old'] or 'N/A'}` → `{values['new'] or 'N/A'}`\n"
                 
@@ -819,6 +846,177 @@ class HistoryPaginatorView(discord.ui.View):
     @discord.ui.button(label="▶", style=discord.ButtonStyle.grey)
     async def next_button(self, i: discord.Interaction, b: discord.ui.Button):
         if self.current_page < self.total_pages - 1: self.current_page += 1; await self.update_message(i)
+
+class PlayerControls(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def seek_playback(self, interaction: discord.Interaction, seconds: int):
+        vc = interaction.guild.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            await interaction.response.send_message("I'm not playing anything right now.", ephemeral=True)
+            return
+
+        guild_id = interaction.guild.id
+        state = music_queues.get(guild_id)
+        if not state:
+            await interaction.response.send_message("There's no active music session.", ephemeral=True)
+            return
+
+        time_since_start = asyncio.get_event_loop().time() - state['start_time']
+        current_position = state['seek_offset'] + time_since_start
+        new_position = current_position + seconds
+
+        track_data = state['queue'][state['current']]
+        duration_str = track_data.get('duration', '0s')
+        total_duration = parse_duration_to_seconds(duration_str)
+
+        new_position = max(0, min(new_position, total_duration - 1))
+
+        state['is_seeking'] = True
+        vc.stop() 
+        
+        await start_playback_for_guild(interaction.guild, seek=new_position)
+        await interaction.response.send_message(f"Jumped {seconds:+} seconds.", ephemeral=True, delete_after=5)
+
+    @discord.ui.button(label="10s", style=discord.ButtonStyle.secondary, emoji="⏪", row=0)
+    async def rewind_10(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.seek_playback(interaction, -10)
+
+    @discord.ui.button(label="5s", style=discord.ButtonStyle.secondary, emoji="◀️", row=0)
+    async def rewind_5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.seek_playback(interaction, -5)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, emoji="⏭️", row=1)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        else:
+            await interaction.followup.send("Not playing anything.", ephemeral=True)
+
+    @discord.ui.button(label="5s", style=discord.ButtonStyle.secondary, emoji="▶️", row=0)
+    async def forward_5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.seek_playback(interaction, 5)
+
+    @discord.ui.button(label="10s", style=discord.ButtonStyle.secondary, emoji="⏩", row=0)
+    async def forward_10(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.seek_playback(interaction, 10)
+        
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await stop_playback(interaction)
+
+def after_playback_handler(guild, error=None):
+    if error:
+        logging.error(f'Player error in guild {guild.id}: {error}')
+    
+    state = music_queues.get(guild.id)
+    if not state: return
+
+    if state.get('is_seeking'):
+        state['is_seeking'] = False
+        return
+
+    next_index = state['current'] + 1
+    if next_index >= len(state['queue']):
+        if state['loop']:
+            next_index = 0
+        else:
+            async def cleanup():
+                vc = state.get('voice_client')
+                if vc and vc.is_connected():
+                    await vc.disconnect()
+                if guild.id in music_control_messages:
+                    try:
+                        msg = music_control_messages.pop(guild.id)
+                        await msg.edit(content="Playback finished.", embed=None, view=None)
+                    except discord.NotFound:
+                        pass
+                if guild.id in music_queues:
+                    del music_queues[guild.id]
+            
+            asyncio.run_coroutine_threadsafe(cleanup(), client.loop)
+            return
+
+    state['current'] = next_index
+    state['seek_offset'] = 0
+    
+    coro = start_playback_for_guild(guild)
+    asyncio.run_coroutine_threadsafe(coro, client.loop)
+
+async def start_playback_for_guild(guild: discord.Guild, seek: float = 0.0):
+    if guild.id not in music_queues or not music_queues[guild.id]['queue']:
+        return
+
+    state = music_queues[guild.id]
+    vc = guild.voice_client
+    if not vc: return
+
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+
+    current_index = state['current']
+    track_data = state['queue'][current_index]
+    
+    audio_url = f"{ASSET_BASE_URL}/assets/audio/{track_data.get('previewUrl')}"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio_url) as r:
+                if r.status != 200:
+                    await log_error_to_channel(f"Could not download audio for playback (Status: {r.status}). URL: {audio_url}")
+                    after_playback_handler(guild) 
+                    return
+                
+                audio_data = await r.read()
+                audio_segment = AudioSegment.from_file(io.BytesIO(audio_data), format="mp3")
+
+    except Exception as e:
+        await log_error_to_channel(f"Error processing audio from {audio_url}: {e}")
+        after_playback_handler(guild)
+        return
+        
+    start_ms = 0
+    if seek > 0:
+        start_ms = int(seek * 1000)
+    else:
+        playback_config = load_json_file(TRACK_PLAYBACK_CONFIG_FILE, {})
+        start_ms = playback_config.get(track_data['id'], 0)
+
+    if start_ms > 0:
+        logging.info(f"Applying custom start time for '{track_data['id']}': {start_ms}ms")
+        audio_segment = audio_segment[start_ms:]
+
+    buffer = io.BytesIO()
+    audio_segment.export(buffer, format="s16le", parameters=["-ar", "48000", "-ac", "2"])
+    buffer.seek(0)
+    
+    state['start_time'] = asyncio.get_event_loop().time()
+    state['seek_offset'] = start_ms / 1000.0
+
+    source = discord.PCMAudio(buffer)
+    state['source'] = source
+    vc.play(source, after=partial(after_playback_handler, guild))
+
+    embed = discord.Embed(
+        title=f"▶️ Now Playing {'(Loop)' if state['loop'] else ''}",
+        description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
+        color=discord.Color.green()
+    )
+    if cover := track_data.get('cover'):
+        embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+    
+    if state['loop']:
+        embed.set_footer(text=f"Song {state['current'] + 1}/{len(state['queue'])}")
+
+    if guild.id in music_control_messages:
+        try:
+            msg = music_control_messages[guild.id]
+            await msg.edit(embed=embed, view=PlayerControls())
+        except discord.NotFound:
+            del music_control_messages[guild.id]
 
 @tasks.loop(seconds=10)
 async def check_for_updates():
@@ -905,7 +1103,7 @@ async def check_for_updates():
                                         
                                         previous_chart_change_ts = mod_info['new'].get('createdAt')
                                         if mod_info['new']['id'] in history_data:
-                                            for past_change in history_data[mod_info['new']['id']][1:]:
+                                            for past_change in history_data[mod_info['new']['id']][1:]: 
                                                 if 'currentversion' in past_change['changes']:
                                                     previous_chart_change_ts = past_change['timestamp']
                                                     break
@@ -948,6 +1146,7 @@ async def check_for_updates():
         save_json_file(TRACK_HISTORY_FILE, history_data)
         save_json_file(MIDI_CHANGES_FILE, midi_changes_data)
         save_json_file(TRACK_CACHE_FILE, {"tracks": live_tracks})
+        ensure_playback_config()
         await update_bot_status()
     except Exception as e:
         await log_error_to_channel(f"Error in check_for_updates task: {str(e)}")
@@ -960,7 +1159,7 @@ async def on_ready():
         logging.info(f"Live tracks fetched: {len(live_tracks or [])}")
         if live_tracks is not None:
             save_json_file(TRACK_CACHE_FILE, {"tracks": live_tracks})
-        
+        ensure_playback_config() 
         logging.info(f"Bot logged in as {client.user} (ID: {client.user.id})")
         logging.info(f"Found {len(client.guilds)} guilds: {[guild.name + ' (' + str(guild.id) + ')' for guild in client.guilds]}")
         
@@ -1074,7 +1273,7 @@ async def generate_path_response(user_id: int, song_data: dict, instrument: Inst
         error_msg = str(e)
         await log_error_to_channel(error_msg)
         return (error_msg, None, None, error_msg)
-    except OSError as e:
+    except OSError as e: 
         error_msg = str(e)
         return (error_msg, None, None, error_msg)
     except Exception as e:
@@ -1201,7 +1400,165 @@ async def path(interaction: discord.Interaction,
         view = TrackSelectionView(matched_tracks, interaction.user.id, 'path', command_args=command_args)
         view.message = await interaction.followup.send(f"Found {len(matched_tracks)} results. Please select one:", view=view)
 
+@tree.command(name="play", description="Plays a song in your voice channel.")
+@app_commands.autocomplete(song_name=track_autocomplete)
+@app_commands.describe(song_name="The name of the song to play.")
+async def play(interaction: discord.Interaction, song_name: str):
+    await interaction.response.defer()
 
+    if not interaction.user.voice:
+        await interaction.followup.send("You must be in a voice channel to use this command.", ephemeral=True)
+        return
+
+    matched_tracks = fuzzy_search_tracks(get_cached_track_data(), song_name)
+    if not matched_tracks:
+        await interaction.followup.send(f"Sorry, I couldn't find a track matching '{song_name}'.")
+        return
+
+    async def start_single_playback(track_data: dict, original_interaction: discord.Interaction):
+        voice_channel = original_interaction.user.voice.channel
+        vc = original_interaction.guild.voice_client
+        
+        try:
+            if vc:
+                if vc.channel != voice_channel: await vc.move_to(voice_channel)
+            else:
+                vc = await voice_channel.connect()
+        except Exception as e:
+             await log_error_to_channel(f"Failed to connect or move voice client: {e}")
+             await original_interaction.followup.send("I couldn't connect to your voice channel.", ephemeral=True)
+             return
+
+        music_queues[original_interaction.guild.id] = {
+            'queue': [track_data], 'current': 0, 'loop': False, 'is_seeking': False,
+            'voice_client': vc, 'start_time': 0, 'seek_offset': 0, 'source': None
+        }
+        
+        embed = discord.Embed(
+            title="▶️ Now Playing",
+            description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
+            color=discord.Color.green()
+        )
+        if cover := track_data.get('cover'):
+            embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+        
+        view = PlayerControls()
+        if original_interaction.message and original_interaction.message.author.id == client.user.id:
+             message = await original_interaction.message.edit(content=None, embed=embed, view=view)
+        else:
+             message = await original_interaction.followup.send(embed=embed, view=view)
+
+        music_control_messages[original_interaction.guild.id] = message
+
+        await start_playback_for_guild(original_interaction.guild)
+
+    if len(matched_tracks) == 1:
+        await start_single_playback(matched_tracks[0], interaction)
+    else:
+        view = TrackSelectionView(matched_tracks, interaction.user.id, 'play', command_args={'playback_handler': start_single_playback})
+        view.message = await interaction.followup.send(f"Found {len(matched_tracks)} results. Please select a song to play:", view=view)
+
+@tree.command(name="play-all", description="Plays all songs in a loop.")
+async def playauto(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    if not interaction.user.voice:
+        await interaction.followup.send("You must be in a voice channel to use this command.", ephemeral=True)
+        return
+
+    all_tracks = get_cached_track_data()
+    if not all_tracks:
+        await interaction.followup.send("I couldn't find any tracks to play.", ephemeral=True)
+        return
+
+    voice_channel = interaction.user.voice.channel
+    vc = interaction.guild.voice_client
+    try:
+        if vc:
+            if vc.channel != voice_channel: await vc.move_to(voice_channel)
+        else:
+            vc = await voice_channel.connect()
+    except Exception as e:
+        await log_error_to_channel(f"Failed to connect or move voice client: {e}")
+        await interaction.followup.send("I couldn't connect to your voice channel.", ephemeral=True)
+        return
+
+    random.shuffle(all_tracks)
+
+    music_queues[interaction.guild.id] = {
+        'queue': all_tracks, 'current': 0, 'loop': True, 'is_seeking': False,
+        'voice_client': vc, 'start_time': 0, 'seek_offset': 0, 'source': None
+    }
+
+    track_data = all_tracks[0]
+    embed = discord.Embed(
+        title="▶️ Now Playing (Auto Loop)",
+        description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
+        color=discord.Color.blue()
+    )
+    if cover := track_data.get('cover'):
+        embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+    
+    embed.set_footer(text=f"Playing 1 of {len(all_tracks)}. Loop is ON.")
+
+    view = PlayerControls()
+    message = await interaction.followup.send(embed=embed, view=view)
+    music_control_messages[interaction.guild.id] = message
+
+    await start_playback_for_guild(interaction.guild)
+
+async def stop_playback(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    vc = interaction.guild.voice_client
+
+    state = music_queues.pop(guild_id, None)
+
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop() 
+        await interaction.response.send_message("⏹️ Playback stopped and queue cleared.", ephemeral=True)
+        if guild_id in music_control_messages:
+            try:
+                msg = music_control_messages.pop(guild_id)
+                await msg.edit(content="Playback stopped.", embed=None, view=None)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+    elif state:
+        await interaction.response.send_message("⏹️ Cleared a stuck queue.", ephemeral=True)
+        if guild_id in music_control_messages:
+            try:
+                msg = music_control_messages.pop(guild_id)
+                await msg.edit(content="Playback stopped.", embed=None, view=None)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+    else:
+        await interaction.response.send_message("I am not currently playing anything.", ephemeral=True)
+
+@tree.command(name="stop", description="Stops playback and clears the queue.")
+async def stop(interaction: discord.Interaction):
+    await stop_playback(interaction)
+
+@tree.command(name="leave", description="Disconnects the bot from the voice channel.")
+async def leave(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    vc = interaction.guild.voice_client
+
+    music_queues.pop(guild_id, None)
+
+    if vc and vc.is_connected():
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        await vc.disconnect()
+        
+    if guild_id in music_control_messages:
+        try:
+            msg = music_control_messages.pop(guild_id)
+            await msg.edit(content="Playback stopped.", embed=None, view=None)
+        except (discord.NotFound, discord.Forbidden):
+            pass
+            
+    await interaction.response.send_message("Disconnected from the voice channel.", ephemeral=True)
+
+# --- MISC & ADMIN COMMANDS ---
 class SuggestionModal(discord.ui.Modal, title="Suggest a Feature"):
     suggestion_input = discord.ui.TextInput(label="Your Suggestion", style=discord.TextStyle.long, 
                                             placeholder="Type your feature suggestion here...", required=True, max_length=1000)
@@ -1217,7 +1574,7 @@ class SuggestionModal(discord.ui.Modal, title="Suggest a Feature"):
             recent_timestamps = [ts for ts in user_timestamps if datetime.fromisoformat(ts) > one_hour_ago]
             
             if len(recent_timestamps) >= 2:
-                await interaction.response.send_message("You have already made 2 suggestions in the last hour. Please try again later.", ephemeral=True)
+                await interaction.response.send_message("You have made 2 suggestions in the last hour. Please try again later.", ephemeral=True)
                 return
 
             suggestion_data["suggestions"].append({"username": str(interaction.user), "user_id": user_id, 
