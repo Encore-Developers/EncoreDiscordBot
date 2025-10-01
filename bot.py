@@ -340,6 +340,7 @@ class PreviewAudioMgr: # i stole this lmao ignore the epic games related stuff
         self.hash = md5(bytes(f"{interaction.user.id}-{interaction.id}-{interaction.message.id}", "utf-8")).digest().hex()
         self.audio_duration = 0
 
+        qi = self.track['track']['qi']
         quicksilver_data = json.loads(qi)
         self.pid = quicksilver_data['pid']
 
@@ -645,6 +646,7 @@ def get_sort_display_name(sort_by: str) -> str:
         'shortest': 'Shortest (Shortest Length)',
         'fastest': 'Fastest (Highest BPM)',
         'slowest': 'Slowest (Lowest BPM)',
+        'newest': 'Newest (Recent Release Year)',
         'oldest': 'Oldest (Oldest Release Year)',
         'charter': 'Charter (A-Z)',
         'charter_za': 'Charter (Z-A)',
@@ -652,6 +654,7 @@ def get_sort_display_name(sort_by: str) -> str:
         'easiest': 'Easiest (Avg. Difficulty)',
         'filesize_largest': 'File Size (Largest)',
         'filesize_smallest': 'File Size (Smallest)',
+        'genre_az': 'Genre (A-Z)',
         'genre_za': 'Genre (Z-A)'
     }
     return sort_display_names.get(sort_by, sort_by.replace('_', '-').title())
