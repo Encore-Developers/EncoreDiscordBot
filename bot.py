@@ -1,7 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -11,6 +7,7 @@ import asyncio
 import re
 import string
 import io
+import os
 import uuid
 import subprocess
 import mido
@@ -24,7 +21,16 @@ from difflib import get_close_matches
 from datetime import datetime, timedelta
 import statistics
 from pydub import AudioSegment
+import numpy as np
+import base64
+from hashlib import md5
 from functools import partial
+
+import concurrent.futures
+import xmltodict
+from pathlib import Path
+import math
+from pydub import utils as pdutils
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,8 +39,8 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = ""
-JSON_DATA_URL = "https://raw.githubusercontent.com/JaydenzKoci/EncoreCustoms/refs/heads/main/data/tracks.json"
-ASSET_BASE_URL = "https://jaydenzkoci.github.io/EncoreCustoms"
+JSON_DATA_URL = "https://raw.githubusercontent.com/Encore-Developers/EncoreCustoms/refs/heads/main/data/tracks.json"
+ASSET_BASE_URL = "https://encore-developers.github.io/EncoreCustoms/"
 CONFIG_FILE = "config.json"
 TRACK_CACHE_FILE = "tracks_cache.json"
 TRACK_PLAYBACK_CONFIG_FILE = "track_playback_config.json"
@@ -42,9 +48,15 @@ TRACK_HISTORY_FILE = "track_history.json"
 SUGGESTIONS_FILE = "suggestions.json"
 CHANGELOG_FILE = "changelog.json"
 MIDI_CHANGES_FILE = "midichanges.json"
+USER_FILTERS_FILE = "user_filters.json"
 
 LOCAL_MIDI_FOLDER = "midi_files/"
 TEMP_FOLDER = "out/"
+PREVIEW_FOLDER = "temp/"
+LOG_CHANNEL = 1391736223286169720 
+
+def tz():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 KEY_NAME_MAP = { # I added this for /trackhistory
     "album": "Album",
@@ -59,11 +71,14 @@ KEY_NAME_MAP = { # I added this for /trackhistory
     "download": "Download",
     "doubleBass": "Double Bass",
     "duration": "Duration",
+    "filesize": "File Size",
+    "music_start_time": "Music Bot | Start Time",
     "featured": "Updated Track",
     "finish": "Finished Track",
     "genre": "Genre",
     "glowTimes": "Modal | Loading Phrase Glow Times",
     "id": "Shortname",
+    "Has_Stems": "Has Stems",
     "is_cover": "Is Cover",
     "is_verified": "Is Verified",
     "key": "Key",
@@ -113,7 +128,7 @@ KEY_NAME_MAP = { # I added this for /trackhistory
 }
 
 intents = discord.Intents.default()
-intents.voice_states = True
+intents.voice_states = True 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 music_queues = {} 
@@ -121,7 +136,8 @@ music_control_messages = {}
 
 if not os.path.exists(LOCAL_MIDI_FOLDER): os.makedirs(LOCAL_MIDI_FOLDER)
 if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
-
+if not os.path.exists(PREVIEW_FOLDER): os.makedirs(PREVIEW_FOLDER)
+if not os.path.exists('temp'): os.makedirs('temp')
 
 def load_json_file(filename: str, default_data: dict | list = None):
     if default_data is None:
@@ -316,6 +332,235 @@ def delete_session_files(session_hash):
     except Exception as e:
         logging.error(f"Error cleaning up files for session {session_hash}", exc_info=e)
 
+class PreviewAudioMgr: # i stole this lmao ignore the epic games related stuff
+    def __init__(self, bot: discord.Client, track: any, interaction: discord.Interaction):
+        self.bot = bot
+        self.interaction = interaction
+        self.track = track
+        self.hash = md5(bytes(f"{interaction.user.id}-{interaction.id}-{interaction.message.id}", "utf-8")).digest().hex()
+        self.audio_duration = 0
+
+        quicksilver_data = json.loads(qi)
+        self.pid = quicksilver_data['pid']
+
+        output_path = f'{PREVIEW_FOLDER}{self.pid}/preview.ogg'
+        if not os.path.exists(output_path):
+            mpd = self.acquire_mpegdash_playlist(quicksilver_data)
+            master_audio_path = self.download_mpd_playlist(mpd)
+            output_path = self.convert_to_ogg(master_audio_path)
+
+        self.output_path = output_path
+
+    def _get_ffmpeg_path(self) -> str:
+        ffmpeg_path = Path('ffmpeg.exe')
+
+        if Path.exists(ffmpeg_path):
+            return str(ffmpeg_path.resolve()).replace('\\', '/')
+        
+    def _get_ffprobe_path(self) -> str:
+        ffprobe_path = Path('ffprobe.exe')
+
+        if Path.exists(ffprobe_path):
+            return str(ffprobe_path.resolve()).replace('\\', '/')
+
+    def acquire_mpegdash_playlist(self, quicksilver_data: any) -> str:
+        endpoint = 'https://cdn.qstv.on.epicgames.com/'
+        url = endpoint + quicksilver_data['pid']
+
+        logging.info(f'[GET] {url}')
+        vod_data = requests.get(url)
+        vod_data.raise_for_status()
+
+        data = vod_data.json()
+        playlist = base64.b64decode(data['playlist'])
+        return playlist
+    
+    def download_mpd_playlist(self, mpd: str) -> str:
+        data = xmltodict.parse(mpd)
+        mpd_node = data['MPD']
+
+        base_url = mpd_node['BaseURL']
+        audio_duration = float(mpd_node['@mediaPresentationDuration'].replace('PT', '').replace('S', ''))
+
+        self.audio_duration = audio_duration
+
+        segment_duration = float(mpd_node['@maxSegmentDuration'].replace('PT', '').replace('S', ''))
+
+        num_segments = math.ceil(audio_duration / segment_duration)
+
+        representation = mpd_node['Period']['AdaptationSet']['Representation']
+        repr_id = int(representation['@id'])
+        sample_rate = int(representation['@audioSamplingRate'])
+
+        init_template = representation['SegmentTemplate']['@initialization']
+        segment_template = representation['SegmentTemplate']['@media']
+        segment_start = int(representation['SegmentTemplate']['@startNumber'])
+
+        output = f'temp/streaming_{self.hash}_'
+        init_file = init_template.replace('$RepresentationID$', str(repr_id))
+        init_path = output + init_file
+        init_url = base_url + init_file
+        logging.info(f'[GET] {init_url}')
+
+        init_data = requests.get(init_url)
+        with open(init_path, 'wb') as init_file_io:
+            init_file_io.write(init_data.content)
+
+        segments = []
+            
+        def download_segment(segment_id):
+            segment_file = segment_template.replace('$RepresentationID$', str(repr_id)).replace('$Number$', str(segment_id))
+            segment_path = output + segment_file
+            segment_url = base_url + segment_file
+
+            logging.info(f'[GET] {segment_url}')
+
+            segment_data = requests.get(segment_url)
+            with open(segment_path, 'wb') as segment_file_io:
+                segment_file_io.write(segment_data.content)
+                segments.append(segment_path)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(download_segment, idx) for idx in range(segment_start, num_segments + 1)]
+            concurrent.futures.wait(futures)
+
+        segments.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+
+        master_file = output + 'master_audio.mp4'
+        with open(master_file, 'wb') as master:
+            master.write(open(init_path, 'rb').read())
+            os.remove(init_path)
+
+            for segment in segments:
+                master.write(open(segment, 'rb').read())
+                os.remove(segment)
+
+        return master_file
+    
+    def convert_to_ogg(self, master_audio_path):
+        output_path = f'{PREVIEW_FOLDER}{self.pid}'
+        os.makedirs(output_path, exist_ok=True)
+        output_path += '/preview.ogg'
+
+        ffmpeg_path = self._get_ffmpeg_path()
+        ffmpeg_command = [
+            ffmpeg_path,
+            '-i',
+            master_audio_path,
+            '-acodec', 
+            'libopus',
+            '-ar',
+            '48000',
+            output_path
+        ]
+        subprocess.run(ffmpeg_command)
+        return output_path
+
+    def get_waveform_bytearray(self) -> tuple[np.uint8, float]:
+        AudioSegment.converter = self._get_ffmpeg_path()
+
+        def override_prober() -> str:
+            return self._get_ffprobe_path()
+        
+        pdutils.get_prober_name = override_prober
+
+        if os.path.exists(self.output_path.replace('preview.ogg', 'waveform.dat')):
+            with open(self.output_path.replace('preview.ogg', 'waveform.dat'), 'rb') as f:
+
+                if os.path.exists(self.output_path.replace('preview.ogg', 'duration.dat')):
+                    duration = float(open(self.output_path.replace('preview.ogg', 'duration.dat'), 'r').read())
+                else:
+                    audio = AudioSegment.from_file(self.output_path, format="ogg")
+                    duration = audio.duration_seconds
+                    open(self.output_path.replace('preview.ogg', 'duration.dat'), 'w').write(f'{duration}')
+
+                return (np.frombuffer(f.read(), dtype=np.uint8), duration)
+
+        audio = AudioSegment.from_file(self.output_path, format="ogg")
+        audio.converter = self._get_ffmpeg_path()
+        duration = audio.duration_seconds
+
+        samples = np.array(audio.get_array_of_samples())
+        sample_rate = audio.frame_rate
+
+        # Normalize to range [-1.0, 1.0]
+        samples = samples / np.max(np.abs(samples))
+
+        # Downsample to 256 points
+        total_samples = len(samples)
+        stride = max(1, total_samples // 256)
+        downsampled = samples[::stride][:256]
+
+        # Scale to 0-255
+        byte_array = np.uint8((downsampled + 1.0) * 127.5)
+
+        # Cache the waveform bytearray
+        with open(self.output_path.replace('preview.ogg', 'waveform.dat'), 'wb') as f:
+            f.write(byte_array.tobytes())
+
+        with open(self.output_path.replace('preview.ogg', 'duration.dat'), 'w') as f:
+            f.write(f'{duration}')
+
+        return (byte_array, duration)
+
+    async def reply_to_interaction_message(self):
+        msg = self.interaction.message
+
+        # url = f'https://discord.com/api/v10/channels/{msg.channel.id}/messages'
+
+        # for responding to an ephmeral button interaction:
+        url = f'https://discord.com/api/v10/webhooks/{self.bot.application.id}/{self.interaction.token}/messages/@original'
+        # + remove message_reference from the payload
+        # + change the method to PATCH
+
+        flags = discord.MessageFlags()
+        flags.voice = True
+
+        wvform_bytearray, audio_duration = self.get_waveform_bytearray()
+        wvform_b64 = base64.b64encode(wvform_bytearray.tobytes()).decode('utf-8')
+
+        payload = {
+            "tts": False,
+            "flags": flags.value,
+            "attachments": [
+                {
+                    "id": "0",
+                    "filename": f"{self.hash}_voice-message.ogg",
+                    "duration_secs": audio_duration,
+                    "waveform": wvform_b64
+                }
+            ] # ,
+            # "message_reference": {
+            #     "message_id": msg.id,
+            #     "channel_id": msg.channel.id,
+            #     "guild_id": msg.guild.id
+            # }
+        }
+        
+        data = bytearray()
+        data.extend(b"--boundary\r\n")
+        data.extend(b"Content-Disposition: form-data; name=\"payload_json\"\r\n")
+        data.extend(b"Content-Type: application/json\r\n\r\n")
+        data.extend(json.dumps(payload, indent=4).encode('utf-8'))
+        data.extend(b"\r\n--boundary\r\n")
+        data.extend(f"Content-Disposition: form-data; name=\"files[0]\"; filename=\"{self.hash}_voice-message.ogg\"\r\n".encode('utf-8'))
+        data.extend(b"Content-Type: audio/ogg\r\n\r\n")
+        data.extend(open(self.output_path, 'rb').read())
+        data.extend(b"\r\n--boundary--")
+
+        logging.info(f'[POST] {url}')
+        resp = requests.patch(url, data=data, headers={
+            "Content-Type": "multipart/form-data; boundary=\"boundary\"",
+            "Authorization": "Bot " + self.bot.http.token
+        })
+
+        logging.info(f'[Interaction {self.interaction.id}] Voice Message Received: {resp.status_code} {resp.reason}')
+
+        if not resp.ok:
+            logging.error(resp.text)
+
+        await self.bot.get_channel(LOG_CHANNEL).send(content=f"{tz()} Voice Message for {self.track['track']['sn']} sent to {self.interaction.user.id}")
+
 
 async def log_error_to_channel(error_message: str):
     logging.error(error_message)
@@ -392,6 +637,60 @@ def parse_duration_to_seconds(duration_str: str) -> int:
         asyncio.create_task(log_error_to_channel(f"Error parsing duration: {str(e)}"))
         return 0
 
+def get_sort_display_name(sort_by: str) -> str:
+    sort_display_names = {
+        'latest': 'Latest (Recent Creation Date)',
+        'earliest': 'Earliest (Oldest Creation Date)',
+        'longest': 'Longest (Longest Length)',
+        'shortest': 'Shortest (Shortest Length)',
+        'fastest': 'Fastest (Highest BPM)',
+        'slowest': 'Slowest (Lowest BPM)',
+        'oldest': 'Oldest (Oldest Release Year)',
+        'charter': 'Charter (A-Z)',
+        'charter_za': 'Charter (Z-A)',
+        'hardest': 'Hardest (Avg. Difficulty)',
+        'easiest': 'Easiest (Avg. Difficulty)',
+        'filesize_largest': 'File Size (Largest)',
+        'filesize_smallest': 'File Size (Smallest)',
+        'genre_za': 'Genre (Z-A)'
+    }
+    return sort_display_names.get(sort_by, sort_by.replace('_', '-').title())
+
+def parse_filesize_to_mb(filesize_str) -> float:
+    try:
+        if not filesize_str:
+            return 0.0
+        
+        filesize_str = str(filesize_str)
+        
+        import re
+        match = re.match(r'([0-9.]+)\s*(GB|MB|KB|gb|mb|kb)?', filesize_str.strip())
+        if not match:
+            try:
+                return float(filesize_str)
+            except:
+                return 0.0
+        
+        number = float(match.group(1))
+        unit = match.group(2)
+        
+        if not unit:
+            return number
+        
+        unit = unit.upper()
+        if unit == 'GB':
+            return number * 1024 
+        elif unit == 'MB':
+            return number
+        elif unit == 'KB':
+            return number / 1024 
+        else:
+            return number 
+            
+    except Exception as e:
+        asyncio.create_task(log_error_to_channel(f"Error parsing filesize: {str(e)}"))
+        return 0.0
+
 def remove_punctuation(text: str) -> str:
     try:
         return text.translate(str.maketrans('', '', string.punctuation))
@@ -418,7 +717,7 @@ def calculate_average_difficulty(track: dict) -> float:
     except Exception:
         return 0.0
 
-def fuzzy_search_tracks(tracks: list, query: str, sort_method: str = None) -> list:
+def fuzzy_search_tracks(tracks: list, query: str, sort_method: str = None, limit_results: bool = True) -> list:
     try:
         sort_map = {
             'latest': ('createdAt', True, 25), 'earliest': ('createdAt', False, 25),
@@ -426,7 +725,9 @@ def fuzzy_search_tracks(tracks: list, query: str, sort_method: str = None) -> li
             'fastest': ('bpm', True, 25), 'slowest': ('bpm', False, 25),
             'newest': ('releaseYear', True, 25), 'oldest': ('releaseYear', False, 25),
             'charter': ('charter', False, 25), 'charter_za': ('charter', True, 25),
-            'hardest': ('avg_difficulty', True, 25), 'easiest': ('avg_difficulty', False, 25)
+            'hardest': ('avg_difficulty', True, 25), 'easiest': ('avg_difficulty', False, 25),
+            'filesize_largest': ('filesize', True, 25), 'filesize_smallest': ('filesize', False, 25),
+            'genre_az': ('genre', False, 25), 'genre_za': ('genre', True, 25)
         }
         if sort_method and sort_method.lower() in sort_map:
             key, reverse, limit = sort_map[sort_method.lower()]
@@ -437,18 +738,31 @@ def fuzzy_search_tracks(tracks: list, query: str, sort_method: str = None) -> li
                 sort_key_func = lambda t: datetime.fromisoformat(t.get(key, '1970-01-01T00:00:00Z').replace('Z', '+00:00')).timestamp()
             elif key == 'charter':
                 sort_key_func = lambda t: t.get(key, '').lower() 
+            elif key == 'genre':
+                sort_key_func = lambda t: t.get(key, '').lower()
             elif key == 'avg_difficulty':
                 sort_key_func = calculate_average_difficulty
+            elif key == 'filesize':
+                sort_key_func = lambda t: parse_filesize_to_mb(t.get(key, '0'))
             else: 
                 sort_key_func = lambda t: t.get(key, 0) if isinstance(t.get(key, 0), (int, float)) else 0
 
             sortable_tracks = [t for t in tracks if t.get(key) is not None and t.get(key) != ''] if key != 'avg_difficulty' else tracks
             
             sorted_tracks = sorted(sortable_tracks, key=sort_key_func, reverse=reverse)
-            return sorted_tracks[:limit]
+            return sorted_tracks[:limit] if limit_results else sorted_tracks
 
         if not query:
             return []
+        
+        # Fish
+        if query.strip() == "🐟":
+            fish_tracks = []
+            for track in tracks:
+                fish_field = track.get('fish', '')
+                if fish_field and '🐟' in fish_field:
+                    fish_tracks.append(track)
+            return fish_tracks
 
         search_term = remove_punctuation(query.lower())
         
@@ -532,11 +846,9 @@ def create_track_embed_and_view(track: dict, author_id: int, is_log: bool = Fals
         embed.add_field(name="Key", value=format_key(track.get('key', 'N/A')))
         embed.add_field(name="Charter", value=track.get('charter', 'N/A'))
         embed.add_field(name="Rating", value=track.get('ageRating', 'N/A'))
-        embed.add_field(name="Avg. Difficulty", value=f"`{create_difficulty_bar(round(avg_difficulty))}`")
+        embed.add_field(name="Avg. Difficulty", value=f"{avg_difficulty:.1f}")
         embed.add_field(name="Shortname", value=f"`{track.get('id', 'N/A')}`")
-        
-        if (loading_phrase := track.get('loading_phrase')):
-            embed.add_field(name="Loading Phrase", value=f"\"{loading_phrase}\"")
+        embed.add_field(name="Source", value=f"`{track.get('source', 'N/A')}`")
         
         instrument_display_order = [
             ('vocals', 'Vocals'),
@@ -544,28 +856,46 @@ def create_track_embed_and_view(track: dict, author_id: int, is_log: bool = Fals
             ('keys', 'Keys'),
             ('bass', 'Bass'),
             ('drums', 'Drums'),
-            ('pro-vocals', 'Pro Vocals'),
-            ('plastic-guitar', 'Pro Lead'),
-            ('plastic-keys', 'Pro Keys'),
-            ('plastic-bass', 'Pro Bass'),
-            ('plastic-drums', 'Pro Drums'),
-            ('real-guitar', 'Real Guitar'),
-            ('real-keys', 'Real Keys'),
-            ('real-bass', 'Real Bass'),
-            ('real-drums', 'Real Drums'),
+            ('pro-vocals', 'Classic Vocals'),
+            ('plastic-guitar', 'Classic Lead'),
+            ('plastic-keys', 'Classic Keys'),
+            ('plastic-bass', 'Classic Bass'),
+            ('plastic-drums', 'Classic Drums'),
+            ('real-guitar', 'Pro Guitar'),
+            ('real-keys', 'Pro Keys'),
+            ('real-bass', 'Pro Bass'),
+            ('real-drums', 'Pro Drums'),
         ]
 
         difficulties = track.get('difficulties', {})
         diff_lines = []
         
+        classic_instruments = ['pro-vocals', 'plastic-guitar', 'plastic-keys', 'plastic-bass', 'plastic-drums']
+        has_classic = any(difficulties.get(key) is not None and difficulties.get(key) != -1 for key, _ in instrument_display_order if key in classic_instruments)
+        
         for key, name in instrument_display_order:
             if (lvl := difficulties.get(key)) is not None and lvl != -1:
-                diff_lines.append(f"{name:<12}: {create_difficulty_bar(lvl)}")
+                difficulty_bar = create_difficulty_bar(lvl)
+                
+                total_width = 50
+                center_pos = total_width // 2
+                
+                name_part = name
+                colon_pos = center_pos - 9
+                bar_start = colon_pos + 2 
+                
+                name_to_colon_spaces = max(1, colon_pos - len(name_part))
+                
+                line_content = f"{name_part}{' ' * name_to_colon_spaces}:{' ' + difficulty_bar}"
+                diff_lines.append(line_content)
 
         diff_text = "\n".join(diff_lines)
 
         if diff_text:
             embed.add_field(name="Instrument Difficulties", value=f"```\n{diff_text}```", inline=False)
+
+        if (loading_phrase := track.get('loading_phrase')):
+            embed.add_field(name="Loading Phrase", value=f"\"{loading_phrase}\"", inline=False)
 
         compatibility_text = "N/A"
         track_format = track.get('format')
@@ -574,16 +904,26 @@ def create_track_embed_and_view(track: dict, author_id: int, is_log: bool = Fals
         elif track_format == 'ini':
             compatibility_text = "ini - (Compatible with Clone Hero, YARG and Encore)"
         
+        filesize = track.get('filesize', '0.0')
+        if isinstance(filesize, str) and ('MB' in filesize.upper() or 'GB' in filesize.upper() or 'KB' in filesize.upper()):
+            filesize_display = filesize
+        else:
+            filesize_display = f"{filesize}MB"
+        embed.add_field(name="File Size", value=filesize_display, inline=True)
+        has_stems_value = track.get('has_stems')
+        has_stems_display = "True" if (has_stems_value is True or has_stems_value == "true") else "False"
+        embed.add_field(name="Has Stems", value=has_stems_display, inline=True)
         embed.add_field(name="Compatibility", value=compatibility_text, inline=True)
 
         if (created_at := track.get('createdAt')):
             ts = int(datetime.fromisoformat(created_at.replace('Z', '+00:00')).timestamp())
             embed.add_field(name="Date Added", value=f"<t:{ts}:F>", inline=False)
         
-        return embed, TrackInfoView(track=track, author_id=author_id)
+        return embed, TrackInfoView(track=track, author_id=author_id, is_log=is_log)
     except Exception as e:
         asyncio.create_task(log_error_to_channel(f"Error creating track embed: {str(e)}"))
         return None, None
+
 
 def create_update_log_embed(old_track: dict, new_track: dict) -> tuple[discord.Embed | None, dict]:
     try:
@@ -628,20 +968,28 @@ def create_update_log_embed(old_track: dict, new_track: dict) -> tuple[discord.E
         return None, {}
 
 class TrackInfoView(discord.ui.View):
-    def __init__(self, track: dict, author_id: int):
+    def __init__(self, track: dict, author_id: int, is_log: bool = False):
         super().__init__(timeout=300.0)
         self.track = track
         self.author_id = author_id
+        self.is_log = is_log
 
         if track.get('id'):
             self.add_item(self.PreviewAudioButton(track=track))
         if track.get('videoUrl'):
             self.add_item(self.PreviewVideoButton(track=track))
         
-        if track.get('songlink'):
-            self.add_item(discord.ui.Button(label="Stream Song", url=track.get('songlink'), row=1, emoji='🎧'))
-        if track.get('download'):
-            self.add_item(discord.ui.Button(label="Download Chart", url=track.get('download'), row=1, emoji='📥'))
+        if is_log and track.get('id'):
+            stream_url = track.get('songlink') or f"{ASSET_BASE_URL}/tracks/{track['id']}"
+            download_url = track.get('download') or f"{ASSET_BASE_URL}/downloads/{track['id']}.zip"
+            
+            self.add_item(discord.ui.Button(label="Stream Song", url=stream_url, row=1, emoji='🎧'))
+            self.add_item(discord.ui.Button(label="Download Chart", url=download_url, row=1, emoji='📥'))
+        else:
+            if track.get('songlink'):
+                self.add_item(discord.ui.Button(label="Stream Song", url=track.get('songlink'), row=1, emoji='🎧'))
+            if track.get('download'):
+                self.add_item(discord.ui.Button(label="Download Chart", url=track.get('download'), row=1, emoji='📥'))
 
         youtube_links = track.get('youtubeLinks', {})
         inst_video_map = {'vocals': 'Vocals', 'lead': 'Lead', 'drums': 'Drums', 'bass': 'Bass'}
@@ -674,10 +1022,60 @@ class TrackInfoView(discord.ui.View):
                     trimmed_audio = audio[start:end] if start is not None and end is not None else audio
                     
                     buffer = io.BytesIO()
-                    trimmed_audio.export(buffer, format="mp3")
+                    trimmed_audio.export(buffer, format="ogg", codec="libopus", parameters=["-ar", "48000"])
                     buffer.seek(0)
                     
-                    await interaction.followup.send(file=discord.File(buffer, "preview.mp3"), ephemeral=True)
+                    duration = trimmed_audio.duration_seconds
+                    samples = np.array(trimmed_audio.get_array_of_samples())
+                    
+                    if len(samples) > 0:
+                        samples = samples / np.max(np.abs(samples))
+                        total_samples = len(samples)
+                        stride = max(1, total_samples // 256)
+                        downsampled = samples[::stride][:256]
+                        byte_array = np.uint8((downsampled + 1.0) * 127.5)
+                    else:
+                        byte_array = np.zeros(256, dtype=np.uint8)
+                    
+                    wvform_b64 = base64.b64encode(byte_array.tobytes()).decode('utf-8')
+                    
+                    hash_str = md5(bytes(f"{interaction.user.id}-{interaction.id}", "utf-8")).digest().hex()
+                    url = f'https://discord.com/api/v10/webhooks/{interaction.client.application.id}/{interaction.token}/messages/@original'
+                    
+                    flags = discord.MessageFlags()
+                    flags.voice = True
+                    
+                    payload = {
+                        "tts": False,
+                        "flags": flags.value,
+                        "attachments": [{
+                            "id": "0",
+                            "filename": f"{hash_str}_voice-message.ogg",
+                            "duration_secs": duration,
+                            "waveform": wvform_b64
+                        }]
+                    }
+                    
+                    data = bytearray()
+                    data.extend(b"--boundary\r\n")
+                    data.extend(b"Content-Disposition: form-data; name=\"payload_json\"\r\n")
+                    data.extend(b"Content-Type: application/json\r\n\r\n")
+                    data.extend(json.dumps(payload).encode('utf-8'))
+                    data.extend(b"\r\n--boundary\r\n")
+                    data.extend(f"Content-Disposition: form-data; name=\"files[0]\"; filename=\"{hash_str}_voice-message.ogg\"\r\n".encode('utf-8'))
+                    data.extend(b"Content-Type: audio/ogg\r\n\r\n")
+                    data.extend(buffer.read())
+                    data.extend(b"\r\n--boundary--")
+                    
+                    resp = requests.patch(url, data=data, headers={
+                        "Content-Type": "multipart/form-data; boundary=\"boundary\"",
+                        "Authorization": "Bot " + interaction.client.http.token
+                    })
+                    
+                    if not resp.ok:
+                        logging.error(f"Voice message failed: {resp.text}")
+                        await interaction.followup.send("Failed to send voice message preview.", ephemeral=True)
+                    
             except Exception as e:
                 await log_error_to_channel(f"Error fetching audio preview: {str(e)}")
                 await interaction.followup.send("An error occurred while fetching the audio preview.", ephemeral=True)
@@ -712,17 +1110,29 @@ class TrackSelectDropdown(discord.ui.Select):
         self.command_args = command_args or {}
 
         for t in self.tracks_map.values():
-            desc = t.get('artist', 'N/A')
-            if sort_lower in ['fastest', 'slowest']: desc += f" | BPM: {t.get('bpm', 'N/A')}"
-            elif sort_lower in ['newest', 'oldest']: desc += f" | Year: {t.get('releaseYear', 'N/A')}"
-            elif sort_lower in ['longest', 'shortest']: desc += f" | Duration: {t.get('duration', 'N/A')}"
-            elif sort_lower in ['latest', 'earliest']:
-                date_str = "N/A"
-                if ca := t.get('createdAt'): date_str = datetime.fromisoformat(ca.replace('Z', '+00:00')).strftime('%Y-%m-%d')
-                desc += f" | Added: {date_str}"
-            elif sort_lower in ['charter', 'charter_za']: desc += f" | Charter: {t.get('charter', 'N/A')}"
-            elif sort_lower in ['hardest', 'easiest']: desc += f" | Avg. Diff: {round(calculate_average_difficulty(t))}/7"
-            options.append(discord.SelectOption(label=t['title'], value=t['id'], description=desc))
+            if command_type == 'play':
+                label = t['title']
+                if len(label) > 100:
+                    label = f"{label[:97]}..."
+                
+                artist = t.get('artist', 'N/A')
+                duration = t.get('duration', 'N/A')
+                desc = f"{artist} | {duration}"
+            else:
+                label = t['title']
+                desc = t.get('artist', 'N/A')
+                if sort_lower in ['fastest', 'slowest']: desc += f" | BPM: {t.get('bpm', 'N/A')}"
+                elif sort_lower in ['newest', 'oldest']: desc += f" | Year: {t.get('releaseYear', 'N/A')}"
+                elif sort_lower in ['longest', 'shortest']: desc += f" | Duration: {t.get('duration', 'N/A')}"
+                elif sort_lower in ['latest', 'earliest']:
+                    date_str = "N/A"
+                    if ca := t.get('createdAt'): date_str = datetime.fromisoformat(ca.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+                    desc += f" | Added: {date_str}"
+                elif sort_lower in ['charter', 'charter_za']: desc += f" | Charter: {t.get('charter', 'N/A')}"
+                elif sort_lower in ['hardest', 'easiest']: desc += f" | Avg. Diff: {round(calculate_average_difficulty(t))}/7"
+                elif sort_lower in ['filesize_largest', 'filesize_smallest']: desc += f" | Size: {t.get('filesize', 'N/A')}"
+            
+            options.append(discord.SelectOption(label=label, value=t['id'], description=desc))
 
         placeholder = f"Select from {len(self.tracks_map)} sorted results..." if sort else f"Select from {len(tracks)} results..."
         super().__init__(placeholder=placeholder, options=options)
@@ -741,7 +1151,7 @@ class TrackSelectDropdown(discord.ui.Select):
                 await interaction.response.defer()
                 playback_handler = self.command_args.get('playback_handler')
                 if playback_handler:
-                    await playback_handler(track, interaction)
+                    await playback_handler(track, interaction, from_dropdown=True)
             elif self.command_type == 'info':
                 embed, view = create_track_embed_and_view(track, interaction.user.id)
                 if embed: await interaction.response.edit_message(content=None, embed=embed, view=view)
@@ -764,6 +1174,138 @@ class TrackSelectDropdown(discord.ui.Select):
             except discord.errors.InteractionResponded:
                 pass
 
+class PaginatedTrackView(discord.ui.View):
+    def __init__(self, tracks: list, author_id: int, command_type: str, sort: str = None, command_args: dict = None):
+        super().__init__(timeout=None) 
+        self.tracks = tracks
+        self.author_id = author_id
+        self.command_type = command_type
+        self.sort = sort
+        self.command_args = command_args or {}
+        self.current_page = 0
+        self.items_per_page = 25
+        self.total_pages = (len(tracks) + self.items_per_page - 1) // self.items_per_page
+        self.message: discord.InteractionMessage = None
+        self.original_content = "" 
+        self.update_view()
+
+    def update_view(self):
+        self.clear_items()
+        
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.tracks))
+        page_tracks = self.tracks[start_idx:end_idx]
+        
+        self.add_item(TrackSelectDropdown(page_tracks, self.command_type, self.sort, self.command_args))
+        
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, disabled=self.current_page == 0, row=1)
+            menu_button = discord.ui.Button(label="Sort Menu", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+            next_button = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=self.current_page >= self.total_pages - 1, row=1)
+            
+            prev_button.callback = self.prev_page
+            menu_button.callback = self.show_sort_menu
+            next_button.callback = self.next_page
+            
+            self.add_item(prev_button)
+            if self.command_type != 'play':
+                self.add_item(menu_button)
+            self.add_item(next_button)
+        else:
+            if self.command_type != 'play':
+                menu_button = discord.ui.Button(label="Sort Menu", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+                menu_button.callback = self.show_sort_menu
+                self.add_item(menu_button)
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_view()
+            content = self.original_content.replace(f"(Page {self.current_page + 2}/{self.total_pages})", f"(Page {self.current_page + 1}/{self.total_pages})")
+            await interaction.response.edit_message(content=content, view=self)
+
+    async def next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_view()
+            content = self.original_content.replace(f"(Page {self.current_page}/{self.total_pages})", f"(Page {self.current_page + 1}/{self.total_pages})")
+            await interaction.response.edit_message(content=content, view=self)
+
+    async def show_sort_menu(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Select a new sorting option:", view=TracksortMenuView(self.author_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("This isn't your session!", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        try:
+            if self.message:
+                for item in self.children: item.disabled = True
+                await self.message.edit(content="Search timed out.", view=self)
+        except Exception as e:
+            await log_error_to_channel(f"Error in paginated track view timeout: {str(e)}")
+
+class TracksortMenuView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60.0)
+        self.user_id = user_id
+        
+        options = [
+            discord.SelectOption(label="Charter (A-Z)", value="charter"),
+            discord.SelectOption(label="Charter (Z-A)", value="charter_za"),
+            discord.SelectOption(label="Hardest (Avg. Difficulty)", value="hardest"),
+            discord.SelectOption(label="Easiest (Avg. Difficulty)", value="easiest"),
+            discord.SelectOption(label="Fastest (Highest BPM)", value="fastest"),
+            discord.SelectOption(label="Slowest (Lowest BPM)", value="slowest"),
+            discord.SelectOption(label="Newest (Recent Release Year)", value="newest"),
+            discord.SelectOption(label="Oldest (Oldest Release Year)", value="oldest"),
+            discord.SelectOption(label="Shortest (Shortest Length)", value="shortest"),
+            discord.SelectOption(label="Longest (Longest Length)", value="longest"),
+            discord.SelectOption(label="Latest (Recent Creation Date)", value="latest"),
+            discord.SelectOption(label="Earliest (Oldest Creation Date)", value="earliest"),
+            discord.SelectOption(label="File Size (Largest)", value="filesize_largest"),
+            discord.SelectOption(label="File Size (Smallest)", value="filesize_smallest"),
+            discord.SelectOption(label="Genre (A-Z)", value="genre_az"),
+            discord.SelectOption(label="Genre (Z-A)", value="genre_za")
+        ]
+        
+        dropdown = discord.ui.Select(placeholder="Choose a sorting option...", options=options)
+        dropdown.callback = self.sort_callback
+        self.add_item(dropdown)
+    
+    async def sort_callback(self, interaction: discord.Interaction):
+        sort_by = interaction.data['values'][0]
+        
+        if sort_by in ["genre_az", "genre_za"]:
+            all_tracks = get_cached_track_data()
+            genres = sorted(list(set(track.get('genre', 'Unknown') for track in all_tracks if track.get('genre'))))
+            
+            if not genres:
+                await interaction.response.send_message("No genres found!", ephemeral=True)
+                return
+            
+            if sort_by == "genre_za":
+                genres = sorted(genres, reverse=True)
+            
+            view = GenreSelectionView(genres, self.user_id, sort_by)
+            await interaction.response.edit_message(content="Select a genre to view tracks:", view=view)
+            return
+        
+        sorted_tracks = fuzzy_search_tracks(get_cached_track_data(), query="", sort_method=sort_by, limit_results=False)
+        
+        if not sorted_tracks:
+            await interaction.response.send_message("Could not find any tracks to sort.", ephemeral=True)
+            return
+        
+        view = PaginatedTrackView(sorted_tracks, self.user_id, 'info', sort=sort_by)
+        content = f"Found {len(sorted_tracks)} tracks sorted by **{get_sort_display_name(sort_by)}** (Page 1/{view.total_pages}):"
+        view.original_content = content
+        
+        await interaction.response.edit_message(content=content, view=view)
+
 class TrackSelectionView(discord.ui.View):
     def __init__(self, tracks: list, author_id: int, command_type: str, sort: str = None, command_args: dict = None):
         super().__init__(timeout=60.0)
@@ -784,6 +1326,7 @@ class TrackSelectionView(discord.ui.View):
                 await self.message.edit(content="Search timed out.", view=self)
         except Exception as e:
             await log_error_to_channel(f"Error in track selection view timeout: {str(e)}")
+
 
 class HistoryPaginatorView(discord.ui.View):
     def __init__(self, track: dict, author_id: int):
@@ -848,8 +1391,12 @@ class HistoryPaginatorView(discord.ui.View):
         if self.current_page < self.total_pages - 1: self.current_page += 1; await self.update_message(i)
 
 class PlayerControls(discord.ui.View):
-    def __init__(self):
+    def __init__(self, track_data: dict = None):
         super().__init__(timeout=None)
+        self.track_data = track_data
+        
+        if track_data and track_data.get('songlink'):
+            self.add_item(discord.ui.Button(label="Song Link", url=track_data['songlink'], emoji='🎧', row=2))
 
     async def seek_playback(self, interaction: discord.Interaction, seconds: int):
         vc = interaction.guild.voice_client
@@ -887,14 +1434,25 @@ class PlayerControls(discord.ui.View):
     async def rewind_5(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.seek_playback(interaction, -5)
 
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, emoji="⏭️", row=1)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸", row=0)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
+        if not vc:
+            await interaction.response.send_message("I'm not connected to a voice channel.", ephemeral=True)
+            return
+            
+        if vc.is_playing():
+            vc.pause()
+            button.label = "Resume"
+            button.emoji = "▶️"
+            await interaction.response.edit_message(view=self)
+        elif vc.is_paused():
+            vc.resume()
+            button.label = "Pause"
+            button.emoji = "⏸"
+            await interaction.response.edit_message(view=self)
         else:
-            await interaction.followup.send("Not playing anything.", ephemeral=True)
+            await interaction.response.send_message("Nothing is currently playing.", ephemeral=True)
 
     @discord.ui.button(label="5s", style=discord.ButtonStyle.secondary, emoji="▶️", row=0)
     async def forward_5(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -903,10 +1461,377 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(label="10s", style=discord.ButtonStyle.secondary, emoji="⏩", row=0)
     async def forward_10(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.seek_playback(interaction, 10)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary, emoji="⏭", row=1)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        else:
+            await interaction.followup.send("Not playing anything.", ephemeral=True)
+
+    @discord.ui.button(label="Menu", style=discord.ButtonStyle.secondary, emoji="📋", row=1)
+    async def menu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Song Menu", view=MusicMenuView(), ephemeral=True)
         
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹", row=1)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await stop_playback(interaction)
+
+class QueueView(discord.ui.View):
+    def __init__(self, track_data: dict):
+        super().__init__(timeout=None)
+        self.track_data = track_data
+        
+        if track_data.get('download'):
+            self.add_item(discord.ui.Button(label="Download Chart", url=track_data['download'], emoji='📥', row=0))
+        
+        if track_data.get('songlink'):
+            self.add_item(discord.ui.Button(label="Song Link", url=track_data['songlink'], emoji='🎧', row=0))
+
+def load_user_filters(user_id: str) -> dict:
+    filters_data = load_json_file(USER_FILTERS_FILE, {})
+    return filters_data.get(user_id, {})
+
+def save_user_filters(user_id: str, filters: dict):
+    filters_data = load_json_file(USER_FILTERS_FILE, {})
+    filters_data[user_id] = filters
+    save_json_file(USER_FILTERS_FILE, filters_data)
+
+def apply_user_filters(tracks: list, user_filters: dict) -> list:
+    filtered_tracks = tracks.copy()
+    
+    if user_filters.get('age_rating'):
+        age_rating = user_filters['age_rating']
+        filtered_tracks = [t for t in filtered_tracks if t.get('ageRating') == age_rating]
+    
+    if user_filters.get('verification') == 'verified':
+        filtered_tracks = [t for t in filtered_tracks if t.get('is_verified') is True]
+    elif user_filters.get('verification') == 'unverified':
+        filtered_tracks = [t for t in filtered_tracks if t.get('is_verified') is not True]
+    
+    if user_filters.get('charter'):
+        charter = user_filters['charter']
+        filtered_tracks = [t for t in filtered_tracks if t.get('charter') == charter]
+    
+    if user_filters.get('year_sort') == 'older_first':
+        filtered_tracks.sort(key=lambda t: int(t.get('releaseYear', 0)) if str(t.get('releaseYear', 0)).isdigit() else 0)
+    elif user_filters.get('year_sort') == 'newer_first':
+        filtered_tracks.sort(key=lambda t: int(t.get('releaseYear', 0)) if str(t.get('releaseYear', 0)).isdigit() else 0, reverse=True)
+    
+    if user_filters.get('duration_sort') == 'shortest':
+        filtered_tracks.sort(key=lambda t: parse_duration_to_seconds(t.get('duration', '0s')))
+    elif user_filters.get('duration_sort') == 'longest':
+        filtered_tracks.sort(key=lambda t: parse_duration_to_seconds(t.get('duration', '0s')), reverse=True)
+    
+    return filtered_tracks
+
+class FilterDropdown(discord.ui.Select):
+    def __init__(self, filter_type: str):
+        self.filter_type = filter_type
+        
+        if filter_type == "age_rating":
+            options = [
+                discord.SelectOption(label="Family Friendly", value="Family Friendly", emoji="👨‍👩‍👧‍👦"),
+                discord.SelectOption(label="Supervision Recommended", value="Supervision Recommended", emoji="⚠️"),
+                discord.SelectOption(label="Mature Content", value="Mature Content", emoji="🔞"),
+                discord.SelectOption(label="Clear Filter", value="clear", emoji="❌")
+            ]
+            placeholder = "Select age rating filter..."
+        elif filter_type == "verification":
+            options = [
+                discord.SelectOption(label="Verified Songs Only", value="verified", emoji="✅"),
+                discord.SelectOption(label="Unverified Songs Only", value="unverified", emoji="❓"),
+                discord.SelectOption(label="Clear Filter", value="clear", emoji="❌")
+            ]
+            placeholder = "Select verification filter..."
+        elif filter_type == "year_sort":
+            options = [
+                discord.SelectOption(label="Older Songs First", value="older_first", emoji="📅"),
+                discord.SelectOption(label="Newer Songs First", value="newer_first", emoji="🆕"),
+                discord.SelectOption(label="Clear Filter", value="clear", emoji="❌")
+            ]
+            placeholder = "Select year sorting..."
+        elif filter_type == "duration_sort":
+            options = [
+                discord.SelectOption(label="Shortest Songs First", value="shortest", emoji="⏱️"),
+                discord.SelectOption(label="Longest Songs First", value="longest", emoji="⏰"),
+                discord.SelectOption(label="Clear Filter", value="clear", emoji="❌")
+            ]
+            placeholder = "Select duration sorting..."
+        
+        super().__init__(placeholder=placeholder, options=options)
+    
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        user_filters = load_user_filters(user_id)
+        
+        if self.values[0] == "clear":
+            if self.filter_type in user_filters:
+                del user_filters[self.filter_type]
+        else:
+            user_filters[self.filter_type] = self.values[0]
+        
+        save_user_filters(user_id, user_filters)
+        
+        filter_name = self.filter_type.replace('_', ' ').title()
+        if self.values[0] == "clear":
+            await interaction.response.send_message(f"Cleared {filter_name} filter!", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Set {filter_name} to: {self.values[0]}", ephemeral=True)
+
+class CharterSelectionView(discord.ui.View):
+    def __init__(self, charters: list, user_id: str):
+        super().__init__(timeout=60.0)
+        self.charters = charters
+        self.user_id = user_id
+        self.current_page = 0
+        self.items_per_page = 25
+        self.total_pages = (len(charters) + self.items_per_page - 1) // self.items_per_page
+        self.update_dropdown()
+    
+    def update_dropdown(self):
+        self.clear_items()
+        
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.charters))
+        page_charters = self.charters[start_idx:end_idx]
+        
+        options = [discord.SelectOption(label="Clear Charter Filter", value="clear", emoji="❌")]
+        for charter in page_charters:
+            options.append(discord.SelectOption(label=charter, value=charter))
+        
+        dropdown = discord.ui.Select(placeholder="Select a charter...", options=options)
+        dropdown.callback = self.charter_callback
+        self.add_item(dropdown)
+        
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=self.current_page == 0)
+            next_button = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=self.current_page >= self.total_pages - 1)
+            
+            prev_button.callback = self.prev_page
+            next_button.callback = self.next_page
+            
+            self.add_item(prev_button)
+            self.add_item(next_button)
+    
+    async def charter_callback(self, interaction: discord.Interaction):
+        user_filters = load_user_filters(self.user_id)
+        
+        if interaction.data['values'][0] == "clear":
+            if 'charter' in user_filters:
+                del user_filters['charter']
+            await interaction.response.send_message("Cleared charter filter!", ephemeral=True)
+        else:
+            user_filters['charter'] = interaction.data['values'][0]
+            await interaction.response.send_message(f"Set charter filter to: {interaction.data['values'][0]}", ephemeral=True)
+        
+        save_user_filters(self.user_id, user_filters)
+    
+    async def prev_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_dropdown()
+            await interaction.response.edit_message(view=self)
+    
+    async def next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_dropdown()
+            await interaction.response.edit_message(view=self)
+
+class GenreSelectionView(discord.ui.View):
+    def __init__(self, genres: list, user_id: int, sort_by: str = "genre_az"):
+        super().__init__(timeout=None) 
+        self.genres = genres
+        self.user_id = user_id
+        self.sort_by = sort_by
+        self.current_page = 0
+        self.items_per_page = 25
+        self.total_pages = (len(genres) + self.items_per_page - 1) // self.items_per_page
+        self.original_content = "Select a genre to view tracks:"
+        self.update_dropdown()
+    
+    def update_dropdown(self):
+        self.clear_items()
+        
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, len(self.genres))
+        page_genres = self.genres[start_idx:end_idx]
+        
+        options = []
+        for genre in page_genres:
+            options.append(discord.SelectOption(label=genre, value=genre))
+        
+        dropdown = discord.ui.Select(placeholder="Select a genre...", options=options)
+        dropdown.callback = self.genre_callback
+        self.add_item(dropdown)
+        
+        if self.total_pages > 1:
+            prev_button = discord.ui.Button(label="◀ Previous", style=discord.ButtonStyle.secondary, disabled=self.current_page == 0, row=1)
+            menu_button = discord.ui.Button(label="Sort Menu", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+            next_button = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, disabled=self.current_page >= self.total_pages - 1, row=1)
+            
+            prev_button.callback = self.prev_page
+            menu_button.callback = self.show_sort_menu
+            next_button.callback = self.next_page
+            
+            self.add_item(prev_button)
+            self.add_item(menu_button)
+            self.add_item(next_button)
+        else:
+            menu_button = discord.ui.Button(label="Sort Menu", style=discord.ButtonStyle.primary, emoji="📋", row=1)
+            menu_button.callback = self.show_sort_menu
+            self.add_item(menu_button)
+    
+    async def genre_callback(self, interaction: discord.Interaction):
+        selected_genre = interaction.data['values'][0]
+        
+        all_tracks = get_cached_track_data()
+        genre_tracks = [track for track in all_tracks if track.get('genre') == selected_genre]
+        
+        if not genre_tracks:
+            await interaction.response.send_message(f"No tracks found for genre: {selected_genre}", ephemeral=True)
+            return
+        
+        if self.sort_by == "genre_za":
+            genre_tracks.sort(key=lambda t: t.get('title', '').lower(), reverse=True)
+        else: 
+            genre_tracks.sort(key=lambda t: t.get('title', '').lower())
+        
+        view = PaginatedTrackView(genre_tracks, self.user_id, 'info', sort=f"{self.sort_by}_{selected_genre}")
+        sort_display = "Z-A" if self.sort_by == "genre_za" else "A-Z"
+        content = f"Found {len(genre_tracks)} tracks in **{selected_genre}** genre sorted {sort_display} (Page 1/{view.total_pages}):"
+        view.original_content = content
+        
+        await interaction.response.edit_message(content=content, view=view)
+    
+    async def prev_page(self, interaction: discord.Interaction):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_dropdown()
+            content = f"{self.original_content} (Page {self.current_page + 1}/{self.total_pages})"
+            await interaction.response.edit_message(content=content, view=self)
+    
+    async def next_page(self, interaction: discord.Interaction):
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+            self.update_dropdown()
+            content = f"{self.original_content} (Page {self.current_page + 1}/{self.total_pages})"
+            await interaction.response.edit_message(content=content, view=self)
+
+    async def show_sort_menu(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(content="Select a new sorting option:", view=TracksortMenuView(self.us))
+
+class MusicMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60.0)
+
+    @discord.ui.button(label="Toggle Loop", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
+    async def toggle_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        state = music_queues.get(guild_id)
+        if not state:
+            await interaction.response.send_message("No active music session.", ephemeral=True)
+            return
+            
+        state['single_loop'] = not state.get('single_loop', False)
+        loop_status = "enabled" if state['single_loop'] else "disabled"
+        await interaction.response.send_message(f"Single track loop {loop_status}.", ephemeral=True)
+
+    @discord.ui.button(label="Shuffle Queue", style=discord.ButtonStyle.secondary, emoji="🔀", row=0)
+    async def shuffle_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        state = music_queues.get(guild_id)
+        if not state or len(state['queue']) <= 1:
+            await interaction.response.send_message("Not enough songs in queue to shuffle.", ephemeral=True)
+            return
+            
+        current_track = state['queue'][state['current']]
+        remaining_queue = state['queue'][state['current'] + 1:]
+        random.shuffle(remaining_queue)
+        state['queue'] = [current_track] + remaining_queue
+        await interaction.response.send_message("Queue shuffled!", ephemeral=True)
+
+    @discord.ui.button(label="View Queue", style=discord.ButtonStyle.secondary, emoji="📋", row=0)
+    async def view_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        state = music_queues.get(guild_id)
+        if not state:
+            await interaction.response.send_message("No active music session.", ephemeral=True)
+            return
+            
+        queue_text = ""
+        for i, track in enumerate(state['queue'][:10]): 
+            prefix = "▶️ " if i == state['current'] else f"{i + 1}. "
+            queue_text += f"{prefix}**{track['title']}** - *{track['artist']}*\n"
+            
+        if len(state['queue']) > 10:
+            queue_text += f"\n... and {len(state['queue']) - 10} more tracks"
+            
+        embed = discord.Embed(title="Music Queue", description=queue_text, color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Filter Settings", style=discord.ButtonStyle.primary, emoji="🔧", row=1)
+    async def filter_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Select a filter type:", view=FilterMenuView(str(interaction.user.id)), ephemeral=True)
+
+class FilterMenuView(discord.ui.View):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=60.0)
+        self.user_id = user_id
+        
+        self.add_item(FilterDropdown("age_rating"))
+        self.add_item(FilterDropdown("verification"))
+        self.add_item(FilterDropdown("year_sort"))
+        self.add_item(FilterDropdown("duration_sort"))
+
+    @discord.ui.button(label="Charter Filter", style=discord.ButtonStyle.secondary, emoji="👤", row=2)
+    async def charter_filter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tracks = get_cached_track_data()
+        charters = sorted(list(set(track.get('charter', 'Unknown') for track in tracks if track.get('charter'))))
+        
+        if not charters:
+            await interaction.response.send_message("No charters found!", ephemeral=True)
+            return
+        
+        view = CharterSelectionView(charters, self.user_id)
+        await interaction.response.send_message("Select a charter:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="View Current Filters", style=discord.ButtonStyle.success, emoji="👁️", row=2)
+    async def view_filters(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_filters = load_user_filters(self.user_id)
+        
+        logging.info(f"User ID: {self.user_id} (type: {type(self.user_id)})")
+        logging.info(f"User filters: {user_filters}")
+        
+        if not user_filters:
+            await interaction.response.send_message(f"You have no active filters. (User ID: {self.user_id})", ephemeral=True)
+            return
+        
+        value_display_map = {
+            'newer_first': 'Newer Songs First',
+            'older_first': 'Older Songs First',
+            'shortest': 'Shortest',
+            'longest': 'Longest',
+            'verified': 'Verified',
+            'unverified': 'Unverified'
+        }
+        
+        filter_text = ""
+        for filter_type, value in user_filters.items():
+            filter_name = filter_type.replace('_', ' ').title()
+            display_value = value_display_map.get(value, value)
+            filter_text += f"**{filter_name}:** {display_value}\n"
+        
+        embed = discord.Embed(title="Your Active Filters", description=filter_text, color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Clear All Filters", style=discord.ButtonStyle.danger, emoji="🗑️", row=2)
+    async def clear_all_filters(self, interaction: discord.Interaction, button: discord.ui.Button):
+        save_user_filters(self.user_id, {})
+        await interaction.response.send_message("All filters cleared!", ephemeral=True)
 
 def after_playback_handler(guild, error=None):
     if error:
@@ -919,21 +1844,57 @@ def after_playback_handler(guild, error=None):
         state['is_seeking'] = False
         return
 
+    if state.get('single_loop', False):
+        state['seek_offset'] = 0
+        coro = start_playback_for_guild(guild)
+        asyncio.run_coroutine_threadsafe(coro, client.loop)
+        return
+
     next_index = state['current'] + 1
     if next_index >= len(state['queue']):
-        if state['loop']:
+        if state.get('loop', False):
             next_index = 0
         else:
             async def cleanup():
                 vc = state.get('voice_client')
-                if vc and vc.is_connected():
-                    await vc.disconnect()
+                last_track = state['queue'][state['current']]
+                
+                listeners = []
+                if vc and vc.channel:
+                    for member in vc.channel.members:
+                        if not member.bot: 
+                            listeners.append(member.display_name)
+                
+                embed = discord.Embed(
+                    title="Finished Playing",
+                    description=f"**{last_track['title']}**\nby *{last_track['artist']}*",
+                    color=discord.Color.orange()
+                )
+                
+                embed.add_field(name="Charter", value=last_track.get('charter', 'N/A'), inline=True)
+                embed.add_field(name="Release Year", value=str(last_track.get('releaseYear', 'N/A')), inline=True)
+                embed.add_field(name="Duration", value=last_track.get('duration', 'N/A'), inline=True)
+                
+                if listeners:
+                    listeners_text = ", ".join(listeners)
+                    if len(listeners_text) > 1024: 
+                        listeners_text = listeners_text[:1021] + "..."
+                    embed.add_field(name=f"👥 Listeners ({len(listeners)})", value=listeners_text, inline=False)
+                else:
+                    embed.add_field(name="👥 Listeners", value="No one was listening", inline=False)
+                
+                if cover := last_track.get('cover'):
+                    embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+                
                 if guild.id in music_control_messages:
                     try:
                         msg = music_control_messages.pop(guild.id)
-                        await msg.edit(content="Playback finished.", embed=None, view=None)
+                        await msg.edit(embed=embed, view=None)
                     except discord.NotFound:
                         pass
+                
+                if vc and vc.is_connected():
+                    await vc.disconnect()
                 if guild.id in music_queues:
                     del music_queues[guild.id]
             
@@ -982,8 +1943,7 @@ async def start_playback_for_guild(guild: discord.Guild, seek: float = 0.0):
     if seek > 0:
         start_ms = int(seek * 1000)
     else:
-        playback_config = load_json_file(TRACK_PLAYBACK_CONFIG_FILE, {})
-        start_ms = playback_config.get(track_data['id'], 0)
+        start_ms = track_data.get('music_start_time', 0)
 
     if start_ms > 0:
         logging.info(f"Applying custom start time for '{track_data['id']}': {start_ms}ms")
@@ -1000,23 +1960,99 @@ async def start_playback_for_guild(guild: discord.Guild, seek: float = 0.0):
     state['source'] = source
     vc.play(source, after=partial(after_playback_handler, guild))
 
+    loop_indicators = []
+    if state.get('loop', False):
+        loop_indicators.append("Queue Loop")
+    if state.get('single_loop', False):
+        loop_indicators.append("Single Loop")
+    
+    title_suffix = f" ({', '.join(loop_indicators)})" if loop_indicators else ""
+    
     embed = discord.Embed(
-        title=f"▶️ Now Playing {'(Loop)' if state['loop'] else ''}",
+        title=f"▶️ Now Playing{title_suffix}",
         description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
         color=discord.Color.green()
     )
+    
+    embed.add_field(name="Charter", value=track_data.get('charter', 'N/A'), inline=True)
+    embed.add_field(name="Release Year", value=str(track_data.get('releaseYear', 'N/A')), inline=True)
+    embed.add_field(name="Duration", value=track_data.get('duration', 'N/A'), inline=True)
+    
     if cover := track_data.get('cover'):
         embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
     
-    if state['loop']:
+    if len(state['queue']) > 1:
         embed.set_footer(text=f"Song {state['current'] + 1}/{len(state['queue'])}")
 
     if guild.id in music_control_messages:
         try:
             msg = music_control_messages[guild.id]
-            await msg.edit(embed=embed, view=PlayerControls())
+            await msg.edit(embed=embed, view=PlayerControls(track_data))
         except discord.NotFound:
             del music_control_messages[guild.id]
+
+async def stop_playback(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    vc = interaction.guild.voice_client
+
+    state = music_queues.pop(guild_id, None)
+
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop() 
+        await interaction.response.send_message("⏹️ Playback stopped and queue cleared.", ephemeral=True)
+        
+        if state and state.get('queue') and guild_id in music_control_messages:
+            current_track = state['queue'][state['current']]
+            
+            listeners = []
+            if vc and vc.channel:
+                for member in vc.channel.members:
+                    if not member.bot: 
+                        listeners.append(member.display_name)
+            
+            embed = discord.Embed(
+                title="Finished Playing (Stopped)",
+                description=f"**{current_track['title']}**\nby *{current_track['artist']}*",
+                color=discord.Color.red()
+            )
+            
+            embed.add_field(name="Charter", value=current_track.get('charter', 'N/A'), inline=True)
+            embed.add_field(name="Release Year", value=str(current_track.get('releaseYear', 'N/A')), inline=True)
+            embed.add_field(name="Duration", value=current_track.get('duration', 'N/A'), inline=True)
+            
+            if listeners:
+                listeners_text = ", ".join(listeners)
+                if len(listeners_text) > 1024:  
+                    listeners_text = listeners_text[:1021] + "..."
+                embed.add_field(name=f"👥 Listeners ({len(listeners)})", value=listeners_text, inline=False)
+            else:
+                embed.add_field(name="👥 Listeners", value="No one was listening", inline=False)
+            
+            if cover := current_track.get('cover'):
+                embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+            
+            try:
+                msg = music_control_messages.pop(guild_id)
+                await msg.edit(embed=embed, view=None)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        elif guild_id in music_control_messages:
+            try:
+                msg = music_control_messages.pop(guild_id)
+                await msg.edit(content="Playback stopped.", embed=None, view=None)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+                
+    elif state:
+        await interaction.response.send_message("⏹️ Cleared a stuck queue.", ephemeral=True)
+        if guild_id in music_control_messages:
+            try:
+                msg = music_control_messages.pop(guild_id)
+                await msg.edit(content="Playback stopped.", embed=None, view=None)
+            except (discord.NotFound, discord.Forbidden):
+                pass
+    else:
+        await interaction.response.send_message("I am not currently playing anything.", ephemeral=True)
 
 @tasks.loop(seconds=10)
 async def check_for_updates():
@@ -1091,19 +2127,30 @@ async def check_for_updates():
                                         f1.write(await r1.read())
                                         f2.write(await r2.read())
                                     
-                                    import compare_midi
-                                    chart_format = mod_info['new'].get('format', 'json')
-                                    comparison_results = compare_midi.run_comparison(
-                                        old_path, new_path, session_id, 
-                                        output_folder=temp_dir, 
-                                        format=chart_format
-                                    )
+                                    try:
+                                        import compare_midi
+                                        chart_format = mod_info['new'].get('format', 'json')
+                                        comparison_results = compare_midi_fast.run_comparison_fast(
+                                            old_path, new_path, session_id, 
+                                            output_folder=temp_dir, 
+                                            format=chart_format
+                                        )
+                                        logging.info(f"Using optimized MIDI comparison for {mod_info['new']['id']}")
+                                    except ImportError:
+                                        import compare_midi
+                                        chart_format = mod_info['new'].get('format', 'json')
+                                        comparison_results = compare_midi.run_comparison(
+                                            old_path, new_path, session_id, 
+                                            output_folder=temp_dir, 
+                                            format=chart_format
+                                        )
+                                        logging.info(f"Using standard MIDI comparison for {mod_info['new']['id']}")
                                     midi_change_log_entry = []
                                     for comp_track_name, image_path in comparison_results:
                                         
                                         previous_chart_change_ts = mod_info['new'].get('createdAt')
                                         if mod_info['new']['id'] in history_data:
-                                            for past_change in history_data[mod_info['new']['id']][1:]: 
+                                            for past_change in history_data[mod_info['new']['id']][1:]:
                                                 if 'currentversion' in past_change['changes']:
                                                     previous_chart_change_ts = past_change['timestamp']
                                                     break
@@ -1159,7 +2206,8 @@ async def on_ready():
         logging.info(f"Live tracks fetched: {len(live_tracks or [])}")
         if live_tracks is not None:
             save_json_file(TRACK_CACHE_FILE, {"tracks": live_tracks})
-        ensure_playback_config() 
+        ensure_playback_config()
+        
         logging.info(f"Bot logged in as {client.user} (ID: {client.user.id})")
         logging.info(f"Found {len(client.guilds)} guilds: {[guild.name + ' (' + str(guild.id) + ')' for guild in client.guilds]}")
         
@@ -1180,16 +2228,23 @@ async def on_ready():
 async def track_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     try:
         choices = []
-        for track in get_cached_track_data():
-            if current.lower() in track.get('title', '').lower():
-                if track['title'] not in [c.name for c in choices]:
-                    choices.append(app_commands.Choice(name=track['title'], value=track['title']))
+        tracks_data = get_cached_track_data()
+        
+        if 'fish' in current.lower() and '🐟' not in current:
+            choices.append(app_commands.Choice(name="🐟 (Fish tracks)", value="🐟"))
+        else:
+            for track in tracks_data:
+                if current.lower() in track.get('title', '').lower():
+                    if track['title'] not in [c.name for c in choices]:
+                        choices.append(app_commands.Choice(name=track['title'], value=track['title']))
+        
         return choices[:25]
     except Exception as e:
         await log_error_to_channel(f"Error in track_autocomplete: {str(e)}")
         return []
 
 async def generate_path_response(user_id: int, song_data: dict, instrument: Instruments, difficulty: Difficulties, squeeze_percent: int, lefty_flip: bool, activation_opacity: int, no_bpms: bool, no_solos: bool, no_time_signatures: bool) -> tuple:
+
     chosen_instrument = instrument.value
     chosen_diff = difficulty.value
     midi_tool = MidiArchiveTools()
@@ -1283,12 +2338,23 @@ async def generate_path_response(user_id: int, song_data: dict, instrument: Inst
     finally:
         delete_session_files(session_hash)
 
+
 @tree.command(name="trackinfo", description="Get detailed information about a specific track.")
 @app_commands.autocomplete(track_name=track_autocomplete)
 @app_commands.describe(track_name="Search by title, artist, or ID.")
 async def trackinfo(interaction: discord.Interaction, track_name: str):
     try:
         await interaction.response.defer()
+        
+        track_redirects = { # funny easter eggs
+            'peakmobilegame': 'jetpackjoyridetheme'
+        }
+        
+        original_track_name = track_name
+        if track_name.lower() in track_redirects:
+            track_name = track_redirects[track_name.lower()]
+            logging.info(f"Redirected track search from '{original_track_name}' to '{track_name}'")
+        
         matched_tracks = fuzzy_search_tracks(get_cached_track_data(), track_name)
         
         if not matched_tracks:
@@ -1299,8 +2365,10 @@ async def trackinfo(interaction: discord.Interaction, track_name: str):
             embed, view = create_track_embed_and_view(matched_tracks[0], interaction.user.id)
             if embed: await interaction.followup.send(embed=embed, view=view)
         else:
-            view = TrackSelectionView(matched_tracks, interaction.user.id, 'info')
-            view.message = await interaction.followup.send(f"Found {len(matched_tracks)} results. Please select one:", view=view, ephemeral=True)
+            view = PaginatedTrackView(matched_tracks, interaction.user.id, 'info')
+            content = f"Found {len(matched_tracks)} tracks matching '{track_name}' (Page 1/{view.total_pages}):"
+            view.original_content = content
+            view.message = await interaction.followup.send(content, view=view)
     except Exception as e:
         await log_error_to_channel(f"Error in trackinfo command: {str(e)}")
         await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
@@ -1313,18 +2381,39 @@ async def trackinfo(interaction: discord.Interaction, track_name: str):
     app_commands.Choice(name="Fastest (Highest BPM)", value="fastest"), app_commands.Choice(name="Slowest (Lowest BPM)", value="slowest"),
     app_commands.Choice(name="Newest (Recent Release Year)", value="newest"), app_commands.Choice(name="Oldest (Oldest Release Year)", value="oldest"),
     app_commands.Choice(name="Shortest (Shortest Length)", value="shortest"), app_commands.Choice(name="Longest (Longest Length)", value="longest"),
-    app_commands.Choice(name="Latest (Recent Creation Date)", value="latest"), app_commands.Choice(name="Earliest (Oldest Creation Date)", value="earliest")])
+    app_commands.Choice(name="Latest (Recent Creation Date)", value="latest"), app_commands.Choice(name="Earliest (Oldest Creation Date)", value="earliest"),
+    app_commands.Choice(name="File Size (Largest)", value="filesize_largest"), app_commands.Choice(name="File Size (Smallest)", value="filesize_smallest"),
+    app_commands.Choice(name="Genre (A-Z)", value="genre_az"), app_commands.Choice(name="Genre (Z-A)", value="genre_za")])
 async def tracksort(interaction: discord.Interaction, sort_by: str):
     try:
         await interaction.response.defer()
-        sorted_tracks = fuzzy_search_tracks(get_cached_track_data(), query="", sort_method=sort_by)
+        
+        if sort_by in ["genre_az", "genre_za"]:
+            all_tracks = get_cached_track_data()
+            genres = sorted(list(set(track.get('genre', 'Unknown') for track in all_tracks if track.get('genre'))))
+            
+            if not genres:
+                await interaction.followup.send("No genres found!", ephemeral=True)
+                return
+            
+            if sort_by == "genre_za":
+                genres = sorted(genres, reverse=True)
+            
+            view = GenreSelectionView(genres, interaction.user.id, sort_by)
+            await interaction.followup.send("Select a genre to view tracks:", view=view)
+            return
+        
+        sorted_tracks = fuzzy_search_tracks(get_cached_track_data(), query="", sort_method=sort_by, limit_results=False)
         
         if not sorted_tracks:
             await interaction.followup.send("Could not find any tracks to sort.", ephemeral=True)
             return
         
-        view = TrackSelectionView(sorted_tracks, interaction.user.id, 'info', sort=sort_by)
-        view.message = await interaction.followup.send(f"Showing top results for tracks sorted by **{sort_by.replace('_', '-').title()}**:", view=view)
+        view = PaginatedTrackView(sorted_tracks, interaction.user.id, 'info', sort=sort_by)
+        content = f"Found {len(sorted_tracks)} tracks sorted by **{get_sort_display_name(sort_by)}** (Page 1/{view.total_pages}):"
+        view.original_content = content
+        view.message = await interaction.followup.send(content, view=view)
+        
     except Exception as e:
         await log_error_to_channel(f"Error in tracksort command: {str(e)}")
         await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
@@ -1415,50 +2504,93 @@ async def play(interaction: discord.Interaction, song_name: str):
         await interaction.followup.send(f"Sorry, I couldn't find a track matching '{song_name}'.")
         return
 
-    async def start_single_playback(track_data: dict, original_interaction: discord.Interaction):
+    async def handle_track_selection(track_data: dict, original_interaction: discord.Interaction, from_dropdown: bool = False):
+        guild_id = original_interaction.guild.id
         voice_channel = original_interaction.user.voice.channel
         vc = original_interaction.guild.voice_client
         
+        if guild_id in music_queues and music_queues[guild_id]['queue']:
+            music_queues[guild_id]['queue'].append(track_data)
+            queue_position = len(music_queues[guild_id]['queue'])
+            
+            embed = discord.Embed(
+                title="🎵 Added to Queue",
+                description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
+                color=discord.Color.blue()
+            )
+            
+            embed.add_field(name="Position in Queue", value=str(queue_position), inline=False)
+            
+            embed.add_field(name="Charter", value=track_data.get('charter', 'N/A'), inline=True)
+            embed.add_field(name="Release Year", value=str(track_data.get('releaseYear', 'N/A')), inline=True)
+            embed.add_field(name="Duration", value=track_data.get('duration', 'N/A'), inline=True)
+            
+            if cover := track_data.get('cover'):
+                embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+
+            view = QueueView(track_data)
+
+            if from_dropdown:
+                try:
+                    await original_interaction.delete_original_response()
+                except:
+                    pass 
+                await original_interaction.followup.send(embed=embed, view=view)
+            else:
+                await original_interaction.followup.send(embed=embed, view=view)
+            return
+        
+
         try:
             if vc:
-                if vc.channel != voice_channel: await vc.move_to(voice_channel)
+                if vc.channel != voice_channel:
+                    await vc.move_to(voice_channel)
             else:
                 vc = await voice_channel.connect()
         except Exception as e:
-             await log_error_to_channel(f"Failed to connect or move voice client: {e}")
-             await original_interaction.followup.send("I couldn't connect to your voice channel.", ephemeral=True)
-             return
+            await log_error_to_channel(f"Failed to connect or move voice client: {e}")
+            await original_interaction.followup.send("I couldn't connect to your voice channel.", ephemeral=True)
+            return
 
-        music_queues[original_interaction.guild.id] = {
-            'queue': [track_data], 'current': 0, 'loop': False, 'is_seeking': False,
+        music_queues[guild_id] = {
+            'queue': [track_data], 'current': 0, 'loop': False, 'single_loop': False, 'is_seeking': False,
             'voice_client': vc, 'start_time': 0, 'seek_offset': 0, 'source': None
         }
-        
+
         embed = discord.Embed(
             title="▶️ Now Playing",
             description=f"**{track_data['title']}**\nby *{track_data['artist']}*",
             color=discord.Color.green()
         )
+        embed.add_field(name="Charter", value=track_data.get('charter', 'N/A'), inline=True)
+        embed.add_field(name="Release Year", value=str(track_data.get('releaseYear', 'N/A')), inline=True)
+        embed.add_field(name="Duration", value=track_data.get('duration', 'N/A'), inline=True)
+        
         if cover := track_data.get('cover'):
             embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
-        
-        view = PlayerControls()
-        if original_interaction.message and original_interaction.message.author.id == client.user.id:
-             message = await original_interaction.message.edit(content=None, embed=embed, view=view)
+
+        view = PlayerControls(track_data)
+        if from_dropdown:
+            try:
+                await original_interaction.delete_original_response()
+            except:
+                pass 
+            message = await original_interaction.followup.send(embed=embed, view=view)
         else:
-             message = await original_interaction.followup.send(embed=embed, view=view)
-
-        music_control_messages[original_interaction.guild.id] = message
-
+            message = await original_interaction.followup.send(embed=embed, view=view)
+        
+        music_control_messages[guild_id] = message
         await start_playback_for_guild(original_interaction.guild)
 
     if len(matched_tracks) == 1:
-        await start_single_playback(matched_tracks[0], interaction)
+        await handle_track_selection(matched_tracks[0], interaction)
     else:
-        view = TrackSelectionView(matched_tracks, interaction.user.id, 'play', command_args={'playback_handler': start_single_playback})
-        view.message = await interaction.followup.send(f"Found {len(matched_tracks)} results. Please select a song to play:", view=view)
+        view = PaginatedTrackView(matched_tracks, interaction.user.id, 'play', command_args={'playback_handler': handle_track_selection})
+        content = f"Found {len(matched_tracks)} results. Please select a song to play (Page 1/{view.total_pages}):"
+        view.original_content = content
+        view.message = await interaction.followup.send(content, view=view)
 
-@tree.command(name="play-all", description="Plays all songs in a loop.")
+@tree.command(name="play-all", description="Plays all songs in a loop with your filter preferences.")
 async def playauto(interaction: discord.Interaction):
     await interaction.response.defer()
 
@@ -1470,6 +2602,13 @@ async def playauto(interaction: discord.Interaction):
     if not all_tracks:
         await interaction.followup.send("I couldn't find any tracks to play.", ephemeral=True)
         return
+    
+    user_filters = load_user_filters(str(interaction.user.id))
+    if user_filters:
+        all_tracks = apply_user_filters(all_tracks, user_filters)
+        if not all_tracks:
+            await interaction.followup.send("No tracks match your current filter settings. Use the Song Menu to adjust your filters.", ephemeral=True)
+            return
 
     voice_channel = interaction.user.voice.channel
     vc = interaction.guild.voice_client
@@ -1482,8 +2621,6 @@ async def playauto(interaction: discord.Interaction):
         await log_error_to_channel(f"Failed to connect or move voice client: {e}")
         await interaction.followup.send("I couldn't connect to your voice channel.", ephemeral=True)
         return
-
-    random.shuffle(all_tracks)
 
     music_queues[interaction.guild.id] = {
         'queue': all_tracks, 'current': 0, 'loop': True, 'is_seeking': False,
@@ -1501,62 +2638,13 @@ async def playauto(interaction: discord.Interaction):
     
     embed.set_footer(text=f"Playing 1 of {len(all_tracks)}. Loop is ON.")
 
-    view = PlayerControls()
+    view = PlayerControls(track_data)
     message = await interaction.followup.send(embed=embed, view=view)
     music_control_messages[interaction.guild.id] = message
 
     await start_playback_for_guild(interaction.guild)
 
-async def stop_playback(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    vc = interaction.guild.voice_client
 
-    state = music_queues.pop(guild_id, None)
-
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop() 
-        await interaction.response.send_message("⏹️ Playback stopped and queue cleared.", ephemeral=True)
-        if guild_id in music_control_messages:
-            try:
-                msg = music_control_messages.pop(guild_id)
-                await msg.edit(content="Playback stopped.", embed=None, view=None)
-            except (discord.NotFound, discord.Forbidden):
-                pass
-    elif state:
-        await interaction.response.send_message("⏹️ Cleared a stuck queue.", ephemeral=True)
-        if guild_id in music_control_messages:
-            try:
-                msg = music_control_messages.pop(guild_id)
-                await msg.edit(content="Playback stopped.", embed=None, view=None)
-            except (discord.NotFound, discord.Forbidden):
-                pass
-    else:
-        await interaction.response.send_message("I am not currently playing anything.", ephemeral=True)
-
-@tree.command(name="stop", description="Stops playback and clears the queue.")
-async def stop(interaction: discord.Interaction):
-    await stop_playback(interaction)
-
-@tree.command(name="leave", description="Disconnects the bot from the voice channel.")
-async def leave(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    vc = interaction.guild.voice_client
-
-    music_queues.pop(guild_id, None)
-
-    if vc and vc.is_connected():
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-        await vc.disconnect()
-        
-    if guild_id in music_control_messages:
-        try:
-            msg = music_control_messages.pop(guild_id)
-            await msg.edit(content="Playback stopped.", embed=None, view=None)
-        except (discord.NotFound, discord.Forbidden):
-            pass
-            
-    await interaction.response.send_message("Disconnected from the voice channel.", ephemeral=True)
 
 # --- MISC & ADMIN COMMANDS ---
 class SuggestionModal(discord.ui.Modal, title="Suggest a Feature"):
@@ -1642,7 +2730,7 @@ async def mysite(interaction: discord.Interaction):
         embed = discord.Embed(
             title="Encore Customs",
 
-            url="https://jaydenzkoci.github.io/EncoreCustoms/",
+            url="https://encore-developers.github.io/EncoreCustoms/",
 
             description="For a much better Browse experience, use the Encore Customs website!",
 
@@ -1675,6 +2763,7 @@ async def bot_info(interaction: discord.Interaction):
             try:
                 pdt_time = datetime.strptime(date_str, "%m-%d-%Y--%I:%M%p")
                 
+
                 utc_time = pdt_time + timedelta(hours=7)
                 
                 timestamp = int(utc_time.timestamp())
@@ -1727,12 +2816,642 @@ async def bot_info(interaction: discord.Interaction):
 
         embed.add_field(name="🗓️ Last Bot Update", value=bot_update_timestamp_str, inline=False)
         
+
         embed.set_footer(text=f"Version {version}")
         
         await interaction.followup.send(embed=embed, view=BotInfoView())
     except Exception as e:
         await log_error_to_channel(f"Error in bot-info command: {str(e)}")
         await interaction.followup.send("An error occurred while fetching bot info.", ephemeral=True)
+
+class DebugTestView(discord.ui.View):
+    
+    def __init__(self, admin_user_id: int):
+        super().__init__(timeout=300.0) 
+        self.admin_user_id = admin_user_id
+    
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_user_id:
+            await interaction.response.send_message("❌ Only the admin who ran this command can use these buttons.", ephemeral=True)
+            return False
+        return True
+    
+    @discord.ui.button(label="Test Title Change", style=discord.ButtonStyle.primary, emoji="📝", row=0)
+    async def test_title_change(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            tracks_data = get_cached_track_data()
+            if not tracks_data:
+                await interaction.followup.send("❌ No tracks available for testing.", ephemeral=True)
+                return
+            
+            import random
+            test_track = random.choice(tracks_data)
+            original_title = test_track.get('title', 'Unknown')
+            
+            test_title = f"{original_title} [TEST]"
+            old_track = test_track.copy()
+            new_track = test_track.copy()
+            new_track['title'] = test_title
+            
+            embed, changes = create_update_log_embed(old_track, new_track)
+            
+            if embed:
+                test_channel_id = 1394182022913593457
+                try:
+                    channel = interaction.client.get_channel(test_channel_id)
+                    if channel:
+                        embed.title = "DEBUG TEST: Track Modified"
+                        embed.color = discord.Color.orange()
+                        await channel.send(embed=embed)
+                        await interaction.followup.send(f"✅ **Test Title Change Posted to Channel!**\nTrack: `{test_track['id']}`\nOriginal: `{original_title}`\nTest: `{test_title}`\nPosted to: <#{test_channel_id}>", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Could not find test channel {test_channel_id}", ephemeral=True)
+                except Exception as channel_error:
+                    await interaction.followup.send(f"❌ Error posting to channel: {str(channel_error)}", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to generate test update log.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error testing title change: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Test Difficulty Change", style=discord.ButtonStyle.secondary, emoji="🎯", row=0)
+    async def test_difficulty_change(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            tracks_data = get_cached_track_data()
+            if not tracks_data:
+                await interaction.followup.send("❌ No tracks available for testing.", ephemeral=True)
+                return
+            
+            import random
+            tracks_with_diff = [t for t in tracks_data if t.get('difficulties')]
+            if not tracks_with_diff:
+                await interaction.followup.send("❌ No tracks with difficulties found for testing.", ephemeral=True)
+                return
+            
+            test_track = random.choice(tracks_with_diff)
+            old_track = test_track.copy()
+            new_track = test_track.copy()
+            
+            difficulties = new_track.get('difficulties', {}).copy()
+            if difficulties:
+                random_instrument = random.choice(list(difficulties.keys()))
+                old_diff = difficulties[random_instrument]
+                new_diff = min(6, max(0, old_diff + random.choice([-1, 1])))
+                difficulties[random_instrument] = new_diff
+                new_track['difficulties'] = difficulties
+            
+            embed, changes = create_update_log_embed(old_track, new_track)
+            
+            if embed:
+                test_channel_id = 1394182022913593457
+                try:
+                    channel = interaction.client.get_channel(test_channel_id)
+                    if channel:
+                        embed.title = "DEBUG TEST: Track Modified"
+                        embed.color = discord.Color.orange()
+                        await channel.send(embed=embed)
+                        await interaction.followup.send(f"✅ **Test Difficulty Change Posted to Channel!**\nTrack: `{test_track['id']}`\nInstrument: `{random_instrument}`\nOld: `{old_diff}` → New: `{new_diff}`\nPosted to: <#{test_channel_id}>", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Could not find test channel {test_channel_id}", ephemeral=True)
+                except Exception as channel_error:
+                    await interaction.followup.send(f"❌ Error posting to channel: {str(channel_error)}", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to generate test update log.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error testing difficulty change: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Test Metadata Change", style=discord.ButtonStyle.success, emoji="📊", row=0)
+    async def test_metadata_change(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            tracks_data = get_cached_track_data()
+            if not tracks_data:
+                await interaction.followup.send("❌ No tracks available for testing.", ephemeral=True)
+                return
+            
+            import random
+            test_track = random.choice(tracks_data)
+            old_track = test_track.copy()
+            new_track = test_track.copy()
+            
+            changes_made = []
+            
+            if 'title' in new_track:
+                old_val = new_track['title']
+                new_track['title'] = f"{old_val} [UPDATED]"
+                changes_made.append(f"title: {old_val} → {new_track['title']}")
+            
+            if 'artist' in new_track:
+                old_val = new_track['artist']
+                new_track['artist'] = f"{old_val} & Test Artist"
+                changes_made.append(f"artist: {old_val} → {new_track['artist']}")
+            
+            if 'charter' in new_track:
+                old_val = new_track['charter']
+                new_track['charter'] = f"{old_val}, Debug Bot"
+                changes_made.append(f"charter: {old_val} → {new_track['charter']}")
+            
+            if 'genre' in new_track:
+                old_val = new_track['genre']
+                genres = ["Rock", "Pop", "Electronic", "Metal", "Alternative", "Indie"]
+                new_track['genre'] = random.choice([g for g in genres if g != old_val])
+                changes_made.append(f"genre: {old_val} → {new_track['genre']}")
+            
+            if 'album' in new_track:
+                old_val = new_track['album']
+                new_track['album'] = f"{old_val} [Remastered]"
+                changes_made.append(f"album: {old_val} → {new_track['album']}")
+            
+            if 'source' in new_track:
+                old_val = new_track['source']
+                sources = ["custom", "rb3dlc", "rb2dlc", "encore", "gh3", "debug_test"]
+                new_track['source'] = random.choice([s for s in sources if s != old_val])
+                changes_made.append(f"source: {old_val} → {new_track['source']}")
+            
+            if 'key' in new_track:
+                old_val = new_track['key']
+                keys = ["C Major", "D Minor", "E♭ Major", "F# Minor", "A♭ Major", "B Minor"]
+                new_track['key'] = random.choice([k for k in keys if k != old_val])
+                changes_made.append(f"key: {old_val} → {new_track['key']}")
+            
+            if 'loading_phrase' in new_track:
+                old_val = new_track['loading_phrase']
+                new_track['loading_phrase'] = f"{old_val} [DEBUG UPDATED]"
+                changes_made.append(f"loading_phrase: {old_val} → {new_track['loading_phrase']}")
+            
+            if 'releaseYear' in new_track:
+                old_val = new_track['releaseYear']
+                new_track['releaseYear'] = old_val + random.choice([-1, 1])
+                changes_made.append(f"releaseYear: {old_val} → {new_track['releaseYear']}")
+            
+            if 'bpm' in new_track:
+                old_val = new_track['bpm']
+                new_track['bpm'] = old_val + random.randint(-10, 10)
+                changes_made.append(f"bpm: {old_val} → {new_track['bpm']}")
+            
+            if 'music_start_time' in new_track:
+                old_val = new_track['music_start_time']
+                new_track['music_start_time'] = old_val + random.randint(-500, 500)
+                changes_made.append(f"music_start_time: {old_val} → {new_track['music_start_time']}")
+            
+            if 'currentVersion' in new_track:
+                old_val = new_track['currentVersion']
+                new_version = str(int(old_val) + 1)
+                new_track['currentVersion'] = new_version
+                changes_made.append(f"currentVersion: {old_val} → {new_version}")
+            
+            if 'filesize' in new_track:
+                old_val = new_track['filesize']
+                try:
+                    size_num = float(old_val.replace('MB', '').replace('GB', '').replace('KB', ''))
+                    new_size = f"{size_num + random.uniform(-1.0, 2.0):.1f}MB"
+                    new_track['filesize'] = new_size
+                    changes_made.append(f"filesize: {old_val} → {new_size}")
+                except:
+                    pass
+            
+            if 'has_stems' in new_track:
+                old_val = new_track['has_stems']
+                new_track['has_stems'] = "false" if old_val == "true" else "true"
+                changes_made.append(f"has_stems: {old_val} → {new_track['has_stems']}")
+            
+            if 'is_verified' in new_track:
+                old_val = new_track['is_verified']
+                new_track['is_verified'] = "false" if old_val == "true" else "true"
+                changes_made.append(f"is_verified: {old_val} → {new_track['is_verified']}")
+            
+            if 'is_cover' in new_track:
+                old_val = new_track['is_cover']
+                new_track['is_cover'] = "false" if old_val == "true" else "true"
+                changes_made.append(f"is_cover: {old_val} → {new_track['is_cover']}")
+            
+            if 'ageRating' in new_track:
+                old_val = new_track['ageRating']
+                ratings = ["Family Friendly", "Suggestive", "Mature"]
+                new_track['ageRating'] = random.choice([r for r in ratings if r != old_val])
+                changes_made.append(f"ageRating: {old_val} → {new_track['ageRating']}")
+            
+            if 'duration' in new_track:
+                old_val = new_track['duration']
+                try:
+                    if 'm' in old_val and 's' in old_val:
+                        parts = old_val.replace('m', '').replace('s', '').split()
+                        minutes = int(parts[0])
+                        seconds = int(parts[1]) if len(parts) > 1 else 0
+                        total_seconds = minutes * 60 + seconds + random.randint(-30, 30)
+                        new_minutes = total_seconds // 60
+                        new_seconds = total_seconds % 60
+                        new_duration = f"{new_minutes}m {new_seconds}s"
+                        new_track['duration'] = new_duration
+                        changes_made.append(f"duration: {old_val} → {new_duration}")
+                except:
+                    pass
+            
+            embed, changes = create_update_log_embed(old_track, new_track)
+            
+            if embed:
+                test_channel_id = 1394182022913593457
+                try:
+                    channel = interaction.client.get_channel(test_channel_id)
+                    if channel:
+                        embed.title = "DEBUG TEST: Track Modified"
+                        embed.color = discord.Color.orange()
+                        await channel.send(embed=embed)
+                        
+                        changes_text = "\n".join(changes_made[:20]) 
+                        if len(changes_made) > 20:
+                            changes_text += f"\n... and {len(changes_made) - 20} more changes"
+                        await interaction.followup.send(f"✅ **Comprehensive Metadata Test Posted to Channel!**\nTrack: `{test_track['id']}`\nTotal Changes: `{len(changes_made)}`\nPosted to: <#{test_channel_id}>\nChanges:\n```\n{changes_text}\n```", ephemeral=True)
+                    else:
+                        await interaction.followup.send(f"❌ Could not find test channel {test_channel_id}", ephemeral=True)
+                except Exception as channel_error:
+                    await interaction.followup.send(f"❌ Error posting to channel: {str(channel_error)}", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to generate test update log.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error testing metadata change: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Test New Track", style=discord.ButtonStyle.danger, emoji="🆕", row=1)
+    async def test_new_track(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            tracks_data = get_cached_track_data()
+            if not tracks_data:
+                await interaction.followup.send("❌ No tracks available for testing.", ephemeral=True)
+                return
+            
+            import random
+            template_track = random.choice(tracks_data)
+            test_id = f"test_{random.randint(10000, 99999)}"
+            
+            new_track = template_track.copy()
+            
+            new_track["id"] = test_id
+            new_track["title"] = f"{template_track.get('title', 'Unknown')} [DEBUG TEST]"
+            new_track["artist"] = f"{template_track.get('artist', 'Unknown')} & Debug Bot"
+            new_track["charter"] = f"{template_track.get('charter', 'Unknown')}, Debug Test"
+            new_track["currentVersion"] = "1"
+            new_track["source"] = "debug_test"
+
+            if 'releaseYear' in new_track:
+                new_track['releaseYear'] = new_track['releaseYear'] + random.randint(-2, 2)
+            
+            if 'filesize' in new_track:
+                try:
+                    size_str = new_track['filesize']
+                    size_num = float(size_str.replace('MB', '').replace('GB', '').replace('KB', ''))
+                    new_size = f"{size_num + random.uniform(-5.0, 5.0):.1f}MB"
+                    new_track['filesize'] = new_size
+                except:
+                    new_track['filesize'] = f"{random.uniform(1.0, 50.0):.1f}MB"
+            
+            if 'has_stems' in new_track:
+                new_track['has_stems'] = random.choice(["true", "false"])
+            
+            if 'bpm' in new_track:
+                new_track['bpm'] = new_track['bpm'] + random.randint(-20, 20)
+            
+            if 'difficulties' in new_track and isinstance(new_track['difficulties'], dict):
+                for instrument in new_track['difficulties']:
+                    current_diff = new_track['difficulties'][instrument]
+                    if isinstance(current_diff, int):
+                        new_diff = max(0, min(6, current_diff + random.choice([-1, 0, 1])))
+                        new_track['difficulties'][instrument] = new_diff
+            
+            new_track['createdAt'] = datetime.now().isoformat() + 'Z'
+            
+            embed, _ = create_track_embed_and_view(new_track, interaction.user.id, is_log=True)
+            
+            if embed:
+                embed.title = "🆕 Test: New Track Added"
+                embed.color = discord.Color.green()
+                embed.add_field(
+                    name="📋 Template Info", 
+                    value=f"**Based on:** {template_track.get('title', 'Unknown')} - {template_track.get('artist', 'Unknown')}\n**Original ID:** `{template_track.get('id', 'Unknown')}`", 
+                    inline=False
+                )
+                
+                test_channel_id = 1394182022913593457
+                try:
+                    channel = interaction.client.get_channel(test_channel_id)
+                    if channel:
+                        embed.title = "DEBUG TEST: New Track Added"
+                        embed.color = discord.Color.green()
+                        await channel.send(embed=embed)
+                        
+                        await interaction.followup.send(
+                            f"✅ **Test New Track Posted to Channel!**\n"
+                            f"**New ID:** `{test_id}`\n"
+                            f"**Template:** `{template_track.get('id', 'Unknown')}`\n"
+                            f"Posted to: <#{test_channel_id}>\n"
+                            f"This simulates what would be sent to update channels for a new track addition.", 
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.followup.send(f"❌ Could not find test channel {test_channel_id}", ephemeral=True)
+                except Exception as channel_error:
+                    await interaction.followup.send(f"❌ Error posting to channel: {str(channel_error)}", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Failed to generate test new track embed.", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error testing new track: {str(e)}", ephemeral=True)
+    
+    @discord.ui.button(label="Test MIDI Change", style=discord.ButtonStyle.secondary, emoji="🎼", row=1)
+    async def test_midi_change(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            tracks_data = get_cached_track_data()
+            if not tracks_data:
+                await interaction.followup.send("❌ No tracks available for testing.", ephemeral=True)
+                return
+            
+            import random
+            import tempfile
+            import os
+            import aiohttp
+            
+            if len(tracks_data) < 2:
+                await interaction.followup.send("❌ Need at least 2 tracks for MIDI comparison test.", ephemeral=True)
+                return
+            
+            track1, track2 = random.sample(tracks_data, 2)
+        
+            old_track = track1.copy()
+            new_track = track1.copy()
+
+            old_version = new_track.get('currentVersion', '1')
+            new_version = str(int(old_version) + 1)
+            new_track['currentVersion'] = new_version
+            
+            embed, changes = create_update_log_embed(old_track, new_track)
+            
+            test_channel_id = 1394182022913593457
+            channel = interaction.client.get_channel(test_channel_id)
+            
+            if not channel:
+                await interaction.followup.send(f"❌ Could not find test channel {test_channel_id}", ephemeral=True)
+                return
+            
+            if embed:
+                embed.title = "DEBUG TEST: Track Modified"
+                embed.color = discord.Color.orange()
+                await channel.send(embed=embed)
+            
+            try:
+                import compare_midi
+                
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    old_midi_url = f"{ASSET_BASE_URL}/assets/midis/{track1['id']}-v1.mid"
+                    new_midi_url = f"{ASSET_BASE_URL}/assets/midis/{track2['id']}-v1.mid"
+                    
+                    old_path = os.path.join(temp_dir, f"{track1['id']}_old.mid")
+                    new_path = os.path.join(temp_dir, f"{track2['id']}_new.mid")
+                    
+                    session_id = f"debug_test_{random.randint(1000, 9999)}"
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(old_midi_url) as r1, session.get(new_midi_url) as r2:
+                            await interaction.followup.send(
+                                f"🔄 **Downloading MIDI files...**\n"
+                                f"Track 1 ({track1['id']}): Status {r1.status}\n"
+                                f"Track 2 ({track2['id']}): Status {r2.status}",
+                                ephemeral=True
+                            )
+                            
+                            if r1.status == 200 and r2.status == 200:
+                                midi1_data = await r1.read()
+                                midi2_data = await r2.read()
+                                
+                                with open(old_path, 'wb') as f1, open(new_path, 'wb') as f2:
+                                    f1.write(midi1_data)
+                                    f2.write(midi2_data)
+                                
+                                if not os.path.exists(old_path) or not os.path.exists(new_path):
+                                    await interaction.followup.send("❌ Failed to write MIDI files to disk.", ephemeral=True)
+                                    return
+                                
+                                file1_size = os.path.getsize(old_path)
+                                file2_size = os.path.getsize(new_path)
+                                
+                                await interaction.followup.send(
+                                    f"📁 **MIDI Files Downloaded:**\n"
+                                    f"File 1: {file1_size} bytes\n"
+                                    f"File 2: {file2_size} bytes\n"
+                                    f"Running comparison...",
+                                    ephemeral=True
+                                )
+                                
+                                chart_format = new_track.get('format', 'json')
+                                logging.info(f"Running MIDI comparison: {old_path} vs {new_path}, format: {chart_format}")
+                                
+                                try:
+                                    import compare_midi_fast
+                                    comparison_results = compare_midi_fast.run_comparison_fast(
+                                        old_path, new_path, session_id,
+                                        output_folder=temp_dir,
+                                        format=chart_format
+                                    )
+                                    await interaction.followup.send("⚡ Using optimized MIDI comparison", ephemeral=True)
+                                    
+                                    await interaction.followup.send(
+                                        f"🔍 **Comparison Results:**\n"
+                                        f"Found {len(comparison_results)} instruments with changes\n"
+                                        f"Results: {[result[0] for result in comparison_results]}",
+                                        ephemeral=True
+                                    )
+                                    
+                                except Exception as comp_error:
+                                    await interaction.followup.send(
+                                        f"❌ **Comparison Error:**\n"
+                                        f"Error: {str(comp_error)}\n"
+                                        f"Type: {type(comp_error).__name__}",
+                                        ephemeral=True
+                                    )
+                                    return
+                                
+                                midi_change_log_entry = []
+                                instruments_changed = []
+                                
+                                for comp_track_name, image_path in comparison_results:
+                                    instruments_changed.append(comp_track_name)
+                                    
+                                    vis_embed = discord.Embed(
+                                        title=f"DEBUG TEST: Chart Changes for {new_track['title']}",
+                                        description=f"Instrument: **{comp_track_name}**\n\n"
+                                                   f"Detected changes between:\n"
+                                                   f"**Old Chart:** {track1['title']} - {track1['artist']} (`{track1['id']}`)\n"
+                                                   f"**New Chart:** {track2['title']} - {track2['artist']} (`{track2['id']}`)\n\n"
+                                                   f"*This is a debug test comparing two different songs' charts.*",
+                                        color=discord.Color.purple(),
+                                    )
+                                    
+                                    if cover := new_track.get('cover'):
+                                        vis_embed.set_thumbnail(url=f"{ASSET_BASE_URL}/assets/covers/{cover}")
+                                    
+                                    if os.path.exists(image_path):
+                                        image_filename = os.path.basename(image_path)
+                                        file = discord.File(image_path, filename=image_filename)
+                                        vis_embed.set_image(url=f"attachment://{image_filename}")
+                                        await channel.send(embed=vis_embed, file=file)
+                                        
+                                        midi_change_log_entry.append({"instrument": comp_track_name, "image_file": image_filename})
+                                
+                                if midi_change_log_entry:
+                                    current_timestamp = datetime.now().isoformat() + 'Z'
+                                    midi_changes_data = load_json_file(MIDI_CHANGES_FILE, {})
+                                    midi_changes_data[current_timestamp] = midi_change_log_entry
+                                    save_json_file(MIDI_CHANGES_FILE, midi_changes_data)
+                                
+                                if instruments_changed:
+                                    await interaction.followup.send(
+                                        f"✅ **Real MIDI Comparison Test Completed!**\n"
+                                        f"**Track Updated:** `{track1['id']}` ({track1['title']})\n"
+                                        f"**Compared Against:** `{track2['id']}` ({track2['title']})\n"
+                                        f"**Instruments Changed:** {', '.join(instruments_changed)}\n"
+                                        f"**Images Generated:** {len(comparison_results)}\n"
+                                        f"Posted to: <#{test_channel_id}>",
+                                        ephemeral=True
+                                    )
+                                else:
+                                    await interaction.followup.send(
+                                        f"✅ **MIDI Comparison Completed - No Changes Detected**\n"
+                                        f"**Track Updated:** `{track1['id']}` ({track1['title']})\n"
+                                        f"**Compared Against:** `{track2['id']}` ({track2['title']})\n"
+                                        f"The charts appear to be identical or very similar.\n"
+                                        f"Posted to: <#{test_channel_id}>",
+                                        ephemeral=True
+                                    )
+                            else:
+                                await interaction.followup.send(
+                                    f"❌ Failed to download MIDI files for comparison.\n"
+                                    f"Track 1 ({track1['id']}): Status {r1.status}\n"
+                                    f"Track 2 ({track2['id']}): Status {r2.status}\n"
+                                    f"URLs tried:\n{old_midi_url}\n{new_midi_url}",
+                                    ephemeral=True
+                                )
+                        
+            except ImportError:
+                await interaction.followup.send("❌ compare_midi module not available for testing.", ephemeral=True)
+            except Exception as midi_error:
+                await interaction.followup.send(f"❌ Error during MIDI comparison: {str(midi_error)}", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error testing MIDI change: {str(e)}", ephemeral=True)
+
+@tree.command(name="debug-updates", description="[ADMIN] View detailed debug information about all update types.")
+async def debug_updates(interaction: discord.Interaction):
+    """Admin-only command to view debug information about all update types."""
+    try:
+        config = load_json_file(CONFIG_FILE, {})
+        admin_users = config.get('admin_users', [])
+        
+        if str(interaction.user.id) not in admin_users and interaction.user.id not in admin_users:
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        track_history = load_json_file(TRACK_HISTORY_FILE, {})
+        tracks_data = get_cached_track_data()
+        config_data = load_json_file(CONFIG_FILE, {})
+        
+        update_types = {}
+        total_updates = 0
+        latest_update = None
+        
+        for track_id, updates in track_history.items():
+            for update in updates:
+                total_updates += 1
+                timestamp = update.get('timestamp')
+                changes = update.get('changes', {})
+                
+                if timestamp:
+                    try:
+                        update_time = datetime.fromisoformat(timestamp)
+                        if not latest_update or update_time > latest_update:
+                            latest_update = update_time
+                    except ValueError:
+                        pass
+                
+                for field, change_data in changes.items():
+                    if field not in update_types:
+                        update_types[field] = {'count': 0, 'tracks': set()}
+                    update_types[field]['count'] += 1
+                    update_types[field]['tracks'].add(track_id)
+        
+        embed = discord.Embed(
+            title="🔧 Debug: Update Analysis",
+            description="Detailed breakdown of all update types in the system",
+            color=discord.Color.orange()
+        )
+        
+        embed.add_field(
+            name="📊 Overall Statistics",
+            value=f"**Total Updates:** {total_updates}\n"
+                  f"**Unique Tracks Updated:** {len(track_history)}\n"
+                  f"**Total Tracks in Database:** {len(tracks_data)}\n"
+                  f"**Last Update:** {f'<t:{int(latest_update.timestamp())}:R>' if latest_update else 'N/A'}",
+            inline=False
+        )
+        
+        if update_types:
+            sorted_types = sorted(update_types.items(), key=lambda x: x[1]['count'], reverse=True)
+            
+            type_text = ""
+            for field, data in sorted_types[:15]: 
+                unique_tracks = len(data['tracks'])
+                type_text += f"**{field}:** {data['count']} updates ({unique_tracks} tracks)\n"
+            
+            if len(sorted_types) > 15:
+                type_text += f"\n... and {len(sorted_types) - 15} more update types"
+            
+            embed.add_field(
+                name="🔄 Update Types (Top 15)",
+                value=type_text,
+                inline=False
+            )
+        
+        update_channels = config_data.get('update_log_channels', {})
+        error_channels = config_data.get('error_log_channels', {})
+        
+        embed.add_field(
+            name="⚙️ Configuration",
+            value=f"**Update Log Channels:** {len(update_channels)}\n"
+                  f"**Error Log Channels:** {len(error_channels)}\n"
+                  f"**Admin Users:** {len(admin_users)}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="🖥️ System Info",
+            value=f"**Bot User ID:** {interaction.client.user.id}\n"
+                  f"**Guild Count:** {len(interaction.client.guilds)}\n"
+                  f"**Command User:** {interaction.user.mention}",
+            inline=True
+        )
+        
+        embed.set_footer(text=f"Debug requested by {interaction.user.display_name}")
+        embed.timestamp = datetime.now()
+        
+        view = DebugTestView(interaction.user.id)
+        
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        
+        logging.info(f"Debug updates command used by {interaction.user.id} ({interaction.user.display_name})")
+        
+    except Exception as e:
+        await log_error_to_channel(f"Error in debug-updates command: {str(e)}")
+        await interaction.followup.send("An error occurred while generating debug information.", ephemeral=True)
 
 if __name__ == "__main__":
     try:

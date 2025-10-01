@@ -18,7 +18,7 @@ note_name_maps = {
     'PART GUITAR': { 116: "Overdrive", 106: "EXPERT 5 Lift", 105: "EXPERT 4 Lift", 104: "EXPERT 3 Lift", 103: "EXPERT 2 Lift", 102: "EXPERT 1 Lift", 100: "EXPERT 5", 99: "EXPERT 4", 98: "EXPERT 3", 97: "EXPERT 2", 96: "EXPERT 1", 93: "HARD 4 Lift", 92: "HARD 3 Lift", 91: "HARD 2 Lift", 90: "HARD 1 Lift", 87: "HARD 4", 86: "HARD 3", 85: "HARD 2", 84: "HARD 1", 81: "MEDIUM 4 Lift", 80: "MEDIUM 3 Lift", 79: "MEDIUM 2 Lift", 78: "MEDIUM 1 Lift", 75: "MEDIUM 4", 74: "MEDIUM 3", 73: "MEDIUM 2", 72: "MEDIUM 1", 69: "EASY 4 Lift", 68: "EASY 3 Lift", 67: "EASY 2 Lift", 66: "EASY 1 Lift", 63: "EASY 4", 62: "EASY 3", 61: "EASY 2", 60: "EASY 1", 59: "Fret 12", 57: "Fret 11", 56: "Fret 10", 55: "Fret 9", 53: "Fret 8", 52: "Fret 7", 50: "Fret 6", 49: "Fret 5", 47: "Fret 4", 45: "Fret 3", 43: "Fret 2", 40: "Fret 1" },
 }
 
-TIME_WINDOW = 25 
+TIME_WINDOW = 25  
 TIME_THRESHOLD = 25  
 
 def load_midi_tracks(file_path):
@@ -158,6 +158,7 @@ def visualize_midi_changes_fast(differences, text_differences, note_name_map, tr
     ax.legend()
     plt.tight_layout()
     
+
     image_path = os.path.join(output_folder, f"{track_name.replace(' ', '_')}_changes_{session_id}.png")
     plt.savefig(image_path, dpi=100) 
     plt.close()
@@ -179,11 +180,12 @@ def run_comparison_fast(midi_file1_path, midi_file2_path, session_id, output_fol
             'PAD VOCALS', 'PAD BASS', 'PAD DRUMS', 'PAD GUITAR', 
             'PRO VOCALS', 'BEAT', 'EVENTS', 'SECTION'
         ]
-    else:  
+    else: 
         tracks_to_compare = [
             'PART BASS', 'PART GUITAR', 'PART DRUMS', 'PART VOCALS', "PRO VOCALS", 
             "PLASTIC GUITAR", "PLASTIC DRUMS", "PLASTIC BASS", 'BEAT', 'EVENTS', 'SECTION'
         ]
+
 
     all_present_track_names = sorted(list(set(tracks1.keys()) | set(tracks2.keys())))
 
@@ -192,7 +194,7 @@ def run_comparison_fast(midi_file1_path, midi_file2_path, session_id, output_fol
     for track_name in tracks_to_actually_compare:
         track1 = tracks1.get(track_name)
         track2 = tracks2.get(track_name)
-  
+        
         note_events1 = extract_note_events_fast(track1, range(128)) if track1 else {}
         note_events2 = extract_note_events_fast(track2, range(128)) if track2 else {}
         
