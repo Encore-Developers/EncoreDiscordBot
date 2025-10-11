@@ -116,7 +116,7 @@ KEY_NAME_MAP = { # I added this for /trackhistory
     "difficulties.real-guitar": "Pro Guitar Difficulty",
     "difficulties.real-keys": "Pro Keys Difficulty",
     "difficulties.real-bass": "Pro Bass Difficulty",
-    "difficulties.real-drums": "Elite Drums Difficulty",
+    "difficulties.elite-drums": "Elite Drums Difficulty",
     "youtubeLinks.vocals": "Vocals Video",
     "youtubeLinks.drums": "Drums Video",
     "youtubeLinks.bass": "Bass Video",
@@ -869,7 +869,7 @@ def create_track_embed_and_view(track: dict, author_id: int, is_log: bool = Fals
             ('real-guitar', 'Pro Guitar'),
             ('real-keys', 'Pro Keys'),
             ('real-bass', 'Pro Bass'),
-            ('elite-drums', 'Elite Drums')
+            ('elite-drums', 'Elite Drums'),
         ]
 
         difficulties = track.get('difficulties', {})
