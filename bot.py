@@ -91,7 +91,7 @@ KEY_NAME_MAP = { # I added this for /trackhistory
     "previewEndTime": "Audio Preview End Time",
     "previewTime": "Audio Preview Start Time",
     "previewUrl": "Audio Preview",
-    "proVoxHarmonies": "Pro Vox Harmonies",
+    "proVoxHarmonies": "Classic Harmonies Tracks",
     "rating": "Rating",
     "releaseYear": "Release Year",
     "rotated": "WIP Track",
@@ -107,16 +107,16 @@ KEY_NAME_MAP = { # I added this for /trackhistory
     "difficulties.bass": "Bass Difficulty",
     "difficulties.drums": "Drums Difficulty",
     "difficulties.keys": "Keys Difficulty",
-    "difficulties.pro-vocals": "Pro Vocals Difficulty",
-    "difficulties.plastic-guitar": "Pro Lead Difficulty",
-    "difficulties.plastic-rhythm": "Pro Rhythm Difficulty",
-    "difficulties.plastic-bass": "Pro Bass Difficulty",
-    "difficulties.plastic-drums": "Pro Drums Difficulty",
-    "difficulties.plastic-keys": "Pro Keys Difficulty",
-    "difficulties.real-guitar": "Real Guitar Difficulty",
-    "difficulties.real-keys": "Real Keys Difficulty",
-    "difficulties.real-bass": "Real Bass Difficulty",
-    "difficulties.real-drums": "Real Drums Difficulty",
+    "difficulties.pro-vocals": "Classic Vocals Difficulty",
+    "difficulties.plastic-guitar": "Classic Lead Difficulty",
+    "difficulties.plastic-rhythm": "Classic Rhythm Difficulty",
+    "difficulties.plastic-bass": "Classic Bass Difficulty",
+    "difficulties.plastic-drums": "Classic Drums Difficulty",
+    "difficulties.plastic-keys": "Classic Keys Difficulty",
+    "difficulties.real-guitar": "Pro Guitar Difficulty",
+    "difficulties.real-keys": "Pro Keys Difficulty",
+    "difficulties.real-bass": "Pro Bass Difficulty",
+    "difficulties.real-drums": "Elite Drums Difficulty",
     "youtubeLinks.vocals": "Vocals Video",
     "youtubeLinks.drums": "Drums Video",
     "youtubeLinks.bass": "Bass Video",
@@ -191,11 +191,11 @@ class Difficulty:
         self.diff_4k = diff_4k
 
 class Instruments(enum.Enum):
-    ProLead = Instrument(english="Pro Lead", lb_code="Solo_PeripheralGuitar", plastic=True, chopt="proguitar", midi_mapping={'json': 'PLASTIC GUITAR', 'ini': 'PART GUITAR'}, path_enabled=True)
-    ProBass = Instrument(english="Pro Bass", lb_code="Solo_PeripheralBass", plastic=True, chopt="probass", midi_mapping={'json': 'PLASTIC BASS', 'ini': 'PART BASS'}, path_enabled=True)
-    ProDrums = Instrument(english="Pro Drums", lb_code="Solo_PeripheralDrum", plastic=True, chopt="drums", midi_mapping={'json': 'PLASTIC DRUMS', 'ini': 'PART DRUMS'}, lb_enabled=False, path_enabled=True)
-    ProVocals = Instrument(english="Pro Vocals", lb_code="Solo_PeripheralVocals", plastic=True, chopt="vocals", midi_mapping={'json': 'PRO VOCALS', 'ini': 'PART VOCALS'}, lb_enabled=False, path_enabled=False)
-    ProKeys = Instrument(english="Pro Keys", lb_code="Solo_PeripheralKeys", plastic=True, chopt="keys", midi_mapping={'json': 'PLASTIC KEYS', 'ini': 'PART KEYS'}, path_enabled=False)
+    ClassicLead = Instrument(english="Classic Lead", lb_code="Solo_PeripheralGuitar", plastic=True, chopt="proguitar", midi_mapping={'json': 'PLASTIC GUITAR', 'ini': 'PART GUITAR'}, path_enabled=True)
+    ClassicBass = Instrument(english="Classic Bass", lb_code="Solo_PeripheralBass", plastic=True, chopt="probass", midi_mapping={'json': 'PLASTIC BASS', 'ini': 'PART BASS'}, path_enabled=True)
+    ClassicDrums = Instrument(english="Classic Drums", lb_code="Solo_PeripheralDrum", plastic=True, chopt="drums", midi_mapping={'json': 'PLASTIC DRUMS', 'ini': 'PART DRUMS'}, lb_enabled=False, path_enabled=True)
+    ClassicVocals = Instrument(english="Classic Vocals", lb_code="Solo_PeripheralVocals", plastic=True, chopt="vocals", midi_mapping={'json': 'PRO VOCALS', 'ini': 'PART VOCALS'}, lb_enabled=False, path_enabled=False)
+    ClassicKeys = Instrument(english="Classic Keys", lb_code="Solo_PeripheralKeys", plastic=True, chopt="keys", midi_mapping={'json': 'PLASTIC KEYS', 'ini': 'PART KEYS'}, path_enabled=False)
     Bass = Instrument(english="Bass", lb_code="Solo_Bass", plastic=False, chopt="bass", midi_mapping={'json': 'PART BASS', 'ini': 'PAD BASS'}, path_enabled=True)
     Lead = Instrument(english="Lead", lb_code="Solo_Guitar", plastic=False, chopt="guitar", midi_mapping={'json': 'PART GUITAR', 'ini': 'PAD GUITAR'}, path_enabled=True)
     Drums = Instrument(english="Drums", lb_code="Solo_Drums", plastic=False, chopt="drums", midi_mapping={'json': 'PART DRUMS', 'ini': 'PAD DRUMS'}, path_enabled=True)
@@ -856,18 +856,20 @@ def create_track_embed_and_view(track: dict, author_id: int, is_log: bool = Fals
         instrument_display_order = [
             ('vocals', 'Vocals'),
             ('lead', 'Lead'),
+            ('rhythm', 'Rhythm'),
             ('keys', 'Keys'),
             ('bass', 'Bass'),
             ('drums', 'Drums'),
             ('pro-vocals', 'Classic Vocals'),
             ('plastic-guitar', 'Classic Lead'),
+            ('plastic-rhythm', 'Classic Rhythm'),
             ('plastic-keys', 'Classic Keys'),
             ('plastic-bass', 'Classic Bass'),
             ('plastic-drums', 'Classic Drums'),
             ('real-guitar', 'Pro Guitar'),
             ('real-keys', 'Pro Keys'),
             ('real-bass', 'Pro Bass'),
-            ('real-drums', 'Pro Drums'),
+            ('elite-drums', 'Elite Drums')
         ]
 
         difficulties = track.get('difficulties', {})

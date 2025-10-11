@@ -1,9 +1,10 @@
 {
-  "version": "1.1.0",
-  "date": "07-21-2025--7:32AM",
+  "version": "1.1.1",
+  "date": "10-11-2025--12:36AM",
   "changes": [
     "Added Overdrive Pathing",
     "Added Midi Change Logs",
-    "Added Emojis To Track Info Embed"
+    "Added Emojis To Track Info Embed",
+    "Fixed minor inconsistencies and added in difficulties for Rhythm and Elite Drum parts"
   ]
 }
